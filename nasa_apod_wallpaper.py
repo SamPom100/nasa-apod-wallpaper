@@ -7,6 +7,8 @@ Fetches the Astronomy Picture of the Day and sets it as macOS desktop background
 import os
 import sys
 import json
+import random
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -18,6 +20,12 @@ WALLPAPER_DIR = Path.home() / ".nasa_apod_wallpapers"
 WALLPAPER_DIR.mkdir(exist_ok=True)
 
 CONFIG_FILE = WALLPAPER_DIR / "config.json"
+
+MIN_IMAGE_SIZE_BYTES = 500 * 1024
+FETCH_ATTEMPTS = 6
+FETCH_RETRY_DELAY_SECONDS = 60
+DESKTOP_ATTEMPTS = 3
+DESKTOP_RETRY_DELAY_SECONDS = 5
 
 
 def load_api_key():
@@ -72,92 +80,130 @@ NASA_API_KEY = load_api_key()
 APOD_API_URL = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}"
 
 
-def fetch_apod_data(date=None):
-    """Fetch the APOD metadata from NASA API"""
+def fetch_apod_data(date=None, exit_on_error=True):
+    """Fetch the APOD metadata from NASA API. Returns data dict, or None on failure if exit_on_error=False."""
     url = APOD_API_URL
     if date:
         url += f"&date={date}"
 
-    try:
-        print(f"Fetching NASA APOD data{f' for {date}' if date else ''}...")
-        with urllib.request.urlopen(url, timeout=10) as response:
-            data = json.loads(response.read().decode())
-        return data
-    except urllib.error.HTTPError as e:
-        if e.code == 500:
-            print(f"NASA API is experiencing issues (500 error).")
-            print("This is a temporary server problem. Please try again later.")
-            print("\nYou can also try a specific date with: python3 nasa_apod_wallpaper.py YYYY-MM-DD")
-        else:
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            print(f"Fetching NASA APOD data{f' for {date}' if date else ''}...")
+            with urllib.request.urlopen(url, timeout=10) as response:
+                return json.loads(response.read().decode())
+        except urllib.error.HTTPError as e:
             print(f"HTTP Error {e.code}: {e.reason}")
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        print(f"Error fetching APOD data: {e}")
-        print("Check your internet connection.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        sys.exit(1)
+            retry = e.code in {429, 500, 502, 503, 504}
+        except urllib.error.URLError as e:
+            print(f"Error fetching APOD data: {e}")
+            retry = True
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            retry = True
+
+        if retry and attempt < FETCH_ATTEMPTS:
+            print(f"Retrying in {FETCH_RETRY_DELAY_SECONDS} seconds...")
+            time.sleep(FETCH_RETRY_DELAY_SECONDS)
+            continue
+
+        if exit_on_error:
+            sys.exit(1)
+        return None
 
 
 def fetch_apod_with_fallback(date=None):
     """Fetch APOD data with fallback to yesterday if today isn't available"""
-    # If a specific date was requested, just fetch that
     if date:
         return fetch_apod_data(date)
 
-    # Try today first
     today = datetime.now().strftime('%Y-%m-%d')
-    try:
-        print(f"Fetching NASA APOD data for today ({today})...")
-        url = APOD_API_URL + f"&date={today}"
-        with urllib.request.urlopen(url, timeout=10) as response:
-            data = json.loads(response.read().decode())
+    data = fetch_apod_data(today, exit_on_error=False)
+    if data is not None:
         return data
-    except urllib.error.HTTPError as e:
-        # If today fails (likely not published yet), try yesterday
-        if e.code == 500:
-            yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-            print(f"Today's APOD not available yet, fetching yesterday ({yesterday})...")
-            return fetch_apod_data(yesterday)
-        else:
-            print(f"HTTP Error {e.code}: {e.reason}")
-            sys.exit(1)
-    except Exception as e:
-        # Try yesterday as fallback for any error
-        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-        print(f"Could not fetch today's APOD, fetching yesterday ({yesterday})...")
-        return fetch_apod_data(yesterday)
+
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    print(f"Could not fetch today's APOD, fetching yesterday ({yesterday})...")
+    return fetch_apod_data(yesterday)
 
 
-def download_image(url, filename):
-    """Download the image from the given URL"""
+def download_image(url, filename, exit_on_error=True):
+    """Download the image from the given URL. Returns path, or None if filtered or failed."""
     try:
         print(f"Downloading image from: {url}")
         filepath = WALLPAPER_DIR / filename
         urllib.request.urlretrieve(url, filepath)
+
+        size = filepath.stat().st_size
+        if size < MIN_IMAGE_SIZE_BYTES:
+            filepath.unlink()
+            print(
+                f"Image too small ({size / 1024:.0f} KB < "
+                f"{MIN_IMAGE_SIZE_BYTES / 1024:.0f} KB threshold), discarded."
+            )
+            return None
+
         print(f"Image saved to: {filepath}")
         return filepath
     except Exception as e:
         print(f"Error downloading image: {e}")
-        sys.exit(1)
+        if exit_on_error:
+            sys.exit(1)
+        return None
+
+
+def pick_cache_images(exclude_path, count):
+    """Pick distinct cached APOD images, excluding the given path."""
+    candidates = list(WALLPAPER_DIR.glob("apod_*.jpg")) + \
+                 list(WALLPAPER_DIR.glob("apod_*.png"))
+    candidates = [p for p in candidates if p.resolve() != Path(exclude_path).resolve()]
+    random.shuffle(candidates)
+    return candidates[:count]
 
 
 def set_macos_wallpaper(image_path):
-    """Set the macOS desktop wallpaper using AppleScript"""
-    try:
-        script = f'''
+    """Set today's image on desktop 1, a random cached image on each other desktop."""
+    script = '''
+    on run imagePaths
         tell application "System Events"
-            tell every desktop
-                set picture to "{image_path}"
-            end tell
+            repeat with desktopIndex from 1 to count of imagePaths
+                set picture of desktop desktopIndex to item desktopIndex of imagePaths
+            end repeat
         end tell
-        '''
-        subprocess.run(['osascript', '-e', script], check=True)
-        print(f"Desktop wallpaper updated successfully!")
-    except subprocess.CalledProcessError as e:
-        print(f"Error setting wallpaper: {e}")
-        sys.exit(1)
+    end run
+    '''
+
+    for attempt in range(1, DESKTOP_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(
+                ['osascript', '-e', 'tell application "System Events" to count of desktops'],
+                check=True, capture_output=True, text=True
+            )
+            desktop_count = int(result.stdout.strip())
+            if desktop_count < 1:
+                raise RuntimeError("No macOS desktops are available")
+
+            assignments = [str(image_path)]
+            cached_images = pick_cache_images(image_path, desktop_count - 1)
+            assignments.extend(str(cached) for cached in cached_images)
+            assignments.extend(
+                str(image_path) for _ in range(desktop_count - len(assignments))
+            )
+
+            subprocess.run(
+                ['osascript', '-e', script, *assignments],
+                check=True, capture_output=True, text=True
+            )
+            for idx, path in enumerate(assignments, start=1):
+                print(f"Desktop {idx}: {Path(path).name}")
+            return
+        except (subprocess.CalledProcessError, RuntimeError, ValueError) as e:
+            if attempt < DESKTOP_ATTEMPTS:
+                print(f"Could not set the wallpaper: {e}")
+                print(f"Retrying in {DESKTOP_RETRY_DELAY_SECONDS} seconds...")
+                time.sleep(DESKTOP_RETRY_DELAY_SECONDS)
+                continue
+            print(f"Error setting wallpaper: {e}")
+            sys.exit(1)
 
 
 def send_notification(title, description):
@@ -188,8 +234,8 @@ def send_notification(title, description):
             pass
 
         # Fallback: AppleScript notification
-        title_escaped = title.replace('"', '\\"').replace("'", "\\'")
-        desc_escaped = desc_short.replace('"', '\\"').replace("'", "\\'")
+        title_escaped = title.replace('\\', '\\\\').replace('"', '\\"')
+        desc_escaped = desc_short.replace('\\', '\\\\').replace('"', '\\"')
         script = f'''
         display notification "{desc_escaped}" with title "NASA APOD" subtitle "{title_escaped}"
         '''
@@ -229,10 +275,75 @@ def cleanup_old_images(keep_count=30):
         print(f"Warning: Error during cleanup: {e}")
 
 
+def backfill(days):
+    """Download the last N days of APODs without setting wallpaper or notifying."""
+    print("=" * 60)
+    print(f"NASA APOD Backfill - last {days} days")
+    print("=" * 60)
+
+    downloaded = 0
+    skipped_existing = 0
+    skipped_video = 0
+    skipped_small = 0
+    failed = 0
+
+    for offset in range(days):
+        date_str = (datetime.now() - timedelta(days=offset)).strftime('%Y-%m-%d')
+
+        # Skip dates we already have cached (any extension)
+        existing = list(WALLPAPER_DIR.glob(f"apod_{date_str}.*"))
+        existing = [p for p in existing if p.suffix.lower() in ('.jpg', '.jpeg', '.png')]
+        if existing:
+            skipped_existing += 1
+            continue
+
+        data = fetch_apod_data(date_str, exit_on_error=False)
+        if data is None:
+            failed += 1
+            continue
+
+        if data.get('media_type') != 'image':
+            print(f"  {date_str}: skipping ({data.get('media_type')})")
+            skipped_video += 1
+            continue
+
+        image_url = data.get('hdurl') or data.get('url')
+        if not image_url:
+            failed += 1
+            continue
+
+        extension = os.path.splitext(image_url)[1] or '.jpg'
+        filename = f"apod_{date_str}{extension}"
+        result = download_image(image_url, filename, exit_on_error=False)
+        if result is None:
+            # Either download failed or filtered out as too small. download_image
+            # prints the reason, so just count it as small for simplicity (the
+            # network-failure path is rare in practice).
+            skipped_small += 1
+        else:
+            downloaded += 1
+
+    print("\n" + "=" * 60)
+    print(f"Backfill complete: {downloaded} downloaded, "
+          f"{skipped_existing} already cached, "
+          f"{skipped_video} non-image, "
+          f"{skipped_small} too small, "
+          f"{failed} failed")
+    print("=" * 60)
+
+    cleanup_old_images(keep_count=30)
+
+
 def main():
     print("=" * 60)
     print("NASA Astronomy Picture of the Day - Wallpaper Setter")
     print("=" * 60)
+
+    # Backfill mode
+    if len(sys.argv) > 1 and sys.argv[1] == "--backfill":
+        days = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+        backfill(days)
+        return
 
     # Get date from command line argument if provided
     date = None
@@ -269,17 +380,27 @@ def main():
 
     # Download the image
     image_path = download_image(image_url, filename)
-
-    # Set as wallpaper
-    set_macos_wallpaper(image_path)
-
-    # Send notification with APOD details
-    title = apod_data.get('title', 'NASA APOD')
-    description = apod_data.get('explanation', '')
-    send_notification(title, description)
-
-    # Clean up old images (keep last 30)
     cleanup_old_images(keep_count=30)
+
+    if image_path is None:
+        # Today's image was filtered out as too small. Fall back to a random
+        # cached image for desktop 1 and skip the notification.
+        fallback_images = pick_cache_images(
+            exclude_path=WALLPAPER_DIR / filename,
+            count=1
+        )
+        if not fallback_images:
+            print("No cached images available to use as fallback.")
+            sys.exit(1)
+        fallback = fallback_images[0]
+        print(f"Using random cached image: {fallback.name}")
+        set_macos_wallpaper(fallback)
+    else:
+        set_macos_wallpaper(image_path)
+
+        title = apod_data.get('title', 'NASA APOD')
+        description = apod_data.get('explanation', '')
+        send_notification(title, description)
 
     print("\n" + "=" * 60)
     print("Description:")
