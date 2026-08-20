@@ -11,6 +11,8 @@ import random
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
+from html.parser import HTMLParser
 from pathlib import Path
 import subprocess
 from datetime import datetime, timedelta
@@ -21,11 +23,13 @@ WALLPAPER_DIR.mkdir(exist_ok=True)
 
 CONFIG_FILE = WALLPAPER_DIR / "config.json"
 
-MIN_IMAGE_SIZE_BYTES = 500 * 1024
 FETCH_ATTEMPTS = 6
 FETCH_RETRY_DELAY_SECONDS = 60
 DESKTOP_ATTEMPTS = 3
 DESKTOP_RETRY_DELAY_SECONDS = 5
+IMAGE_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.tif', '.tiff'
+}
 
 
 def load_api_key():
@@ -78,6 +82,37 @@ def load_api_key():
 # Load API key
 NASA_API_KEY = load_api_key()
 APOD_API_URL = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}"
+APOD_SITE_URL = "https://apod.nasa.gov/apod"
+
+
+class ApodPageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.current_link = None
+        self.full_image_path = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag.lower() == 'a':
+            self.current_link = attributes.get('href')
+        elif tag.lower() == 'img' and self.current_link:
+            source = attributes.get('src')
+            link_extension = Path(
+                urllib.parse.urlparse(self.current_link).path
+            ).suffix.lower()
+            source_extension = Path(
+                urllib.parse.urlparse(source or '').path
+            ).suffix.lower()
+            if (
+                link_extension in IMAGE_EXTENSIONS
+                and source_extension in IMAGE_EXTENSIONS
+                and self.full_image_path is None
+            ):
+                self.full_image_path = self.current_link
+
+    def handle_endtag(self, tag):
+        if tag.lower() == 'a':
+            self.current_link = None
 
 
 def fetch_apod_data(date=None, exit_on_error=True):
@@ -127,35 +162,92 @@ def fetch_apod_with_fallback(date=None):
 
 
 def download_image(url, filename, exit_on_error=True):
-    """Download the image from the given URL. Returns path, or None if filtered or failed."""
+    """Download the image from the given URL. Returns path, or None on failure."""
+    filepath = WALLPAPER_DIR / filename
+    temporary_path = filepath.with_suffix(f"{filepath.suffix}.download")
+
     try:
         print(f"Downloading image from: {url}")
-        filepath = WALLPAPER_DIR / filename
-        urllib.request.urlretrieve(url, filepath)
-
-        size = filepath.stat().st_size
-        if size < MIN_IMAGE_SIZE_BYTES:
-            filepath.unlink()
-            print(
-                f"Image too small ({size / 1024:.0f} KB < "
-                f"{MIN_IMAGE_SIZE_BYTES / 1024:.0f} KB threshold), discarded."
-            )
-            return None
+        urllib.request.urlretrieve(url, temporary_path)
+        temporary_path.replace(filepath)
 
         print(f"Image saved to: {filepath}")
         return filepath
     except Exception as e:
+        if temporary_path.exists():
+            temporary_path.unlink()
         print(f"Error downloading image: {e}")
         if exit_on_error:
             sys.exit(1)
         return None
 
 
+def image_extension(url):
+    """Return a supported image extension from a URL."""
+    extension = Path(urllib.parse.urlparse(url).path).suffix.lower()
+    return extension if extension in IMAGE_EXTENSIONS else '.jpg'
+
+
+def fetch_apod_page_image_url(date_str):
+    """Fetch the highest-resolution image URL from the APOD webpage."""
+    try:
+        date = datetime.strptime(date_str, '%Y-%m-%d')
+        page_url = f"{APOD_SITE_URL}/ap{date:%y%m%d}.html"
+        print("Fetching the APOD webpage for its full-resolution image...")
+        with urllib.request.urlopen(page_url, timeout=10) as response:
+            page = response.read().decode('utf-8', errors='replace')
+
+        parser = ApodPageParser()
+        parser.feed(page)
+        if parser.full_image_path:
+            return urllib.parse.urljoin(page_url, parser.full_image_path)
+        print("Error: The APOD webpage has no full-resolution image link")
+    except Exception as e:
+        print(f"Error fetching the APOD webpage: {e}")
+    return None
+
+
+def download_apod_image(apod_data, date_str, exit_on_error=True):
+    """Download the API full-resolution image or its APOD webpage fallback."""
+    api_url = apod_data.get('hdurl')
+    if api_url:
+        filename = f"apod_{date_str}{image_extension(api_url)}"
+        image_path = download_image(api_url, filename, exit_on_error=False)
+        if image_path is not None:
+            return image_path
+        print("The API full-resolution image failed.")
+    else:
+        print("The API has no full-resolution image URL.")
+
+    page_url = fetch_apod_page_image_url(date_str)
+    if page_url:
+        filename = f"apod_{date_str}{image_extension(page_url)}"
+        image_path = download_image(page_url, filename, exit_on_error=False)
+        if image_path is not None:
+            return image_path
+
+    print("Error: Could not download a full-resolution APOD image")
+    if exit_on_error:
+        sys.exit(1)
+    return None
+
+
+def cached_image_files():
+    """Return cached APOD image files."""
+    return [
+        path for path in WALLPAPER_DIR.glob("apod_*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+
+
 def pick_cache_images(exclude_path, count):
     """Pick distinct cached APOD images, excluding the given path."""
-    candidates = list(WALLPAPER_DIR.glob("apod_*.jpg")) + \
-                 list(WALLPAPER_DIR.glob("apod_*.png"))
-    candidates = [p for p in candidates if p.resolve() != Path(exclude_path).resolve()]
+    candidates = cached_image_files()
+    if exclude_path is not None:
+        candidates = [
+            path for path in candidates
+            if path.resolve() != Path(exclude_path).resolve()
+        ]
     random.shuffle(candidates)
     return candidates[:count]
 
@@ -248,9 +340,7 @@ def send_notification(title, description):
 def cleanup_old_images(keep_count=30):
     """Remove old APOD images, keeping only the most recent ones"""
     try:
-        # Find all APOD image files
-        image_files = list(WALLPAPER_DIR.glob("apod_*.jpg")) + \
-                      list(WALLPAPER_DIR.glob("apod_*.png"))
+        image_files = cached_image_files()
 
         if len(image_files) <= keep_count:
             return  # Nothing to clean up
@@ -284,15 +374,16 @@ def backfill(days):
     downloaded = 0
     skipped_existing = 0
     skipped_video = 0
-    skipped_small = 0
     failed = 0
 
     for offset in range(days):
         date_str = (datetime.now() - timedelta(days=offset)).strftime('%Y-%m-%d')
 
         # Skip dates we already have cached (any extension)
-        existing = list(WALLPAPER_DIR.glob(f"apod_{date_str}.*"))
-        existing = [p for p in existing if p.suffix.lower() in ('.jpg', '.jpeg', '.png')]
+        existing = [
+            path for path in cached_image_files()
+            if path.stem == f"apod_{date_str}"
+        ]
         if existing:
             skipped_existing += 1
             continue
@@ -307,19 +398,9 @@ def backfill(days):
             skipped_video += 1
             continue
 
-        image_url = data.get('hdurl') or data.get('url')
-        if not image_url:
-            failed += 1
-            continue
-
-        extension = os.path.splitext(image_url)[1] or '.jpg'
-        filename = f"apod_{date_str}{extension}"
-        result = download_image(image_url, filename, exit_on_error=False)
+        result = download_apod_image(data, date_str, exit_on_error=False)
         if result is None:
-            # Either download failed or filtered out as too small. download_image
-            # prints the reason, so just count it as small for simplicity (the
-            # network-failure path is rare in practice).
-            skipped_small += 1
+            failed += 1
         else:
             downloaded += 1
 
@@ -327,7 +408,6 @@ def backfill(days):
     print(f"Backfill complete: {downloaded} downloaded, "
           f"{skipped_existing} already cached, "
           f"{skipped_video} non-image, "
-          f"{skipped_small} too small, "
           f"{failed} failed")
     print("=" * 60)
 
@@ -366,41 +446,20 @@ def main():
         print("Cannot set as wallpaper. Please try again tomorrow!")
         sys.exit(0)
 
-    # Get the HD URL if available, otherwise use standard URL
-    image_url = apod_data.get('hdurl') or apod_data.get('url')
-
-    if not image_url:
-        print("Error: No image URL found in APOD data")
-        sys.exit(1)
-
-    # Create filename from date and title
     date_str = apod_data.get('date', datetime.now().strftime('%Y-%m-%d'))
-    extension = os.path.splitext(image_url)[1] or '.jpg'
-    filename = f"apod_{date_str}{extension}"
 
-    # Download the image
-    image_path = download_image(image_url, filename)
+    image_path = download_apod_image(apod_data, date_str, exit_on_error=False)
     cleanup_old_images(keep_count=30)
 
     if image_path is None:
-        # Today's image was filtered out as too small. Fall back to a random
-        # cached image for desktop 1 and skip the notification.
-        fallback_images = pick_cache_images(
-            exclude_path=WALLPAPER_DIR / filename,
-            count=1
-        )
-        if not fallback_images:
-            print("No cached images available to use as fallback.")
-            sys.exit(1)
-        fallback = fallback_images[0]
-        print(f"Using random cached image: {fallback.name}")
-        set_macos_wallpaper(fallback)
-    else:
-        set_macos_wallpaper(image_path)
+        print("The wallpaper was not changed.")
+        sys.exit(1)
 
-        title = apod_data.get('title', 'NASA APOD')
-        description = apod_data.get('explanation', '')
-        send_notification(title, description)
+    set_macos_wallpaper(image_path)
+
+    title = apod_data.get('title', 'NASA APOD')
+    description = apod_data.get('explanation', '')
+    send_notification(title, description)
 
     print("\n" + "=" * 60)
     print("Description:")

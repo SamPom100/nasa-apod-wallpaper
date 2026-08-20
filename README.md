@@ -8,6 +8,8 @@ Automatically set NASA's Astronomy Picture of the Day as your macOS desktop wall
 
 - 🚀 Fetches NASA's daily Astronomy Picture of the Day
 - 🖼️ Downloads high-resolution images
+- Uses the APOD webpage when the API full-resolution link fails
+- Never uses the lower-resolution API display image
 - 💻 Automatically sets as macOS desktop background
 - 📅 Can fetch images from specific dates
 - ⏰ Optional daily auto-update via LaunchAgent
