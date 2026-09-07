@@ -32,19 +32,34 @@ IMAGE_EXTENSIONS = {
 }
 
 
-def load_api_key():
+def load_config():
+    """Load configuration dictionary from config file."""
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Warning: Could not read config file: {e}")
+    return {}
+
+
+def load_api_key(config=None):
     """Load API key from config file or environment variable"""
     # First try environment variable
     api_key = os.environ.get("NASA_API_KEY")
     if api_key:
         return api_key
 
+    # Then try config dict
+    if config and config.get('api_key'):
+        return config.get('api_key')
+
     # Then try config file
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, 'r') as f:
-                config = json.load(f)
-                api_key = config.get('api_key')
+                cfg = json.load(f)
+                api_key = cfg.get('api_key')
                 if api_key:
                     return api_key
         except Exception as e:
@@ -66,13 +81,16 @@ def load_api_key():
 
     # Try to get key interactively
     try:
-        api_key = input("\nEnter your NASA API key (or press Ctrl+C to exit): ").strip()
-        if api_key:
-            # Save it to config file
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump({"api_key": api_key}, f, indent=2)
-            print(f"\nAPI key saved to {CONFIG_FILE}")
-            return api_key
+        api_key = input("\nEnter your NASA API key (press Enter to use DEMO_KEY, or Ctrl+C to exit): ").strip()
+        if not api_key:
+            api_key = "DEMO_KEY"
+        current_cfg = load_config()
+        current_cfg["api_key"] = api_key
+        # Save it to config file
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(current_cfg, f, indent=2)
+        print(f"\nAPI key saved to {CONFIG_FILE}")
+        return api_key
     except (KeyboardInterrupt, EOFError):
         print("\nSetup cancelled.")
 
@@ -80,7 +98,8 @@ def load_api_key():
 
 
 # Load API key
-NASA_API_KEY = load_api_key()
+CONFIG = load_config()
+NASA_API_KEY = load_api_key(CONFIG)
 APOD_API_URL = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}"
 APOD_SITE_URL = "https://apod.nasa.gov/apod"
 
@@ -252,17 +271,27 @@ def pick_cache_images(exclude_path, count):
     return candidates[:count]
 
 
-def set_macos_wallpaper(image_path):
-    """Set today's image on desktop 1, a random cached image on each other desktop."""
-    script = '''
-    on run imagePaths
-        tell application "System Events"
-            repeat with desktopIndex from 1 to count of imagePaths
-                set picture of desktop desktopIndex to item desktopIndex of imagePaths
-            end repeat
-        end tell
-    end run
-    '''
+def set_macos_wallpaper(image_path, desktop_1_only=False):
+    """Set the macOS desktop wallpaper (desktop 1 only, or all desktops)."""
+    if desktop_1_only:
+        script = '''
+        on run argv
+            set imagePath to item 1 of argv
+            tell application "System Events"
+                set picture of desktop 1 to imagePath
+            end tell
+        end run
+        '''
+    else:
+        script = '''
+        on run imagePaths
+            tell application "System Events"
+                repeat with desktopIndex from 1 to count of imagePaths
+                    set picture of desktop desktopIndex to item desktopIndex of imagePaths
+                end repeat
+            end tell
+        end run
+        '''
 
     for attempt in range(1, DESKTOP_ATTEMPTS + 1):
         try:
@@ -274,19 +303,26 @@ def set_macos_wallpaper(image_path):
             if desktop_count < 1:
                 raise RuntimeError("No macOS desktops are available")
 
-            assignments = [str(image_path)]
-            cached_images = pick_cache_images(image_path, desktop_count - 1)
-            assignments.extend(str(cached) for cached in cached_images)
-            assignments.extend(
-                str(image_path) for _ in range(desktop_count - len(assignments))
-            )
+            if desktop_1_only:
+                subprocess.run(
+                    ['osascript', '-e', script, str(image_path)],
+                    check=True, capture_output=True, text=True
+                )
+                print(f"Desktop 1: {Path(image_path).name}")
+            else:
+                assignments = [str(image_path)]
+                cached_images = pick_cache_images(image_path, desktop_count - 1)
+                assignments.extend(str(cached) for cached in cached_images)
+                assignments.extend(
+                    str(image_path) for _ in range(desktop_count - len(assignments))
+                )
 
-            subprocess.run(
-                ['osascript', '-e', script, *assignments],
-                check=True, capture_output=True, text=True
-            )
-            for idx, path in enumerate(assignments, start=1):
-                print(f"Desktop {idx}: {Path(path).name}")
+                subprocess.run(
+                    ['osascript', '-e', script, *assignments],
+                    check=True, capture_output=True, text=True
+                )
+                for idx, path in enumerate(assignments, start=1):
+                    print(f"Desktop {idx}: {Path(path).name}")
             return
         except (subprocess.CalledProcessError, RuntimeError, ValueError) as e:
             if attempt < DESKTOP_ATTEMPTS:
@@ -414,6 +450,19 @@ def backfill(days):
     cleanup_old_images(keep_count=30)
 
 
+def get_current_desktop_1_wallpaper():
+    """Return the Path to the current wallpaper set on desktop 1, or None."""
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', 'tell application "System Events" to get picture of desktop 1'],
+            capture_output=True, text=True, check=True
+        )
+        output = result.stdout.strip()
+        return Path(output) if output else None
+    except Exception:
+        return None
+
+
 def main():
     print("=" * 60)
     print("NASA Astronomy Picture of the Day - Wallpaper Setter")
@@ -425,11 +474,39 @@ def main():
         backfill(days)
         return
 
+    # Configuration and options
+    config = load_config()
+    desktop_1_only = config.get("desktop_1_only", False)
+    if "--desktop-1-only" in sys.argv:
+        desktop_1_only = True
+    elif "--all-desktops" in sys.argv:
+        desktop_1_only = False
+
+    # Check for --force flag
+    force_update = "--force" in sys.argv
+    args = [
+        arg for arg in sys.argv[1:]
+        if arg not in ("--force", "--desktop-1-only", "--all-desktops")
+    ]
+
     # Get date from command line argument if provided
     date = None
-    if len(sys.argv) > 1:
-        date = sys.argv[1]
+    if args:
+        date = args[0]
         print(f"Requesting APOD for date: {date}")
+
+    today_str = datetime.now().strftime('%Y-%m-%d')
+
+    # If running for today without --force, check if already downloaded & set
+    if date is None and not force_update:
+        current_wallpaper = get_current_desktop_1_wallpaper()
+        today_files = [
+            path for path in cached_image_files()
+            if path.stem == f"apod_{today_str}"
+        ]
+        if today_files and current_wallpaper and today_files[0].resolve() == current_wallpaper.resolve():
+            print(f"Today's APOD ({today_str}) is already set as Desktop 1 wallpaper.")
+            return
 
     # Fetch APOD data (with fallback to yesterday if today isn't available)
     apod_data = fetch_apod_with_fallback(date)
@@ -455,7 +532,7 @@ def main():
         print("The wallpaper was not changed.")
         sys.exit(1)
 
-    set_macos_wallpaper(image_path)
+    set_macos_wallpaper(image_path, desktop_1_only=desktop_1_only)
 
     title = apod_data.get('title', 'NASA APOD')
     description = apod_data.get('explanation', '')

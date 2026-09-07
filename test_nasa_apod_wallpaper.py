@@ -158,5 +158,77 @@ class CachedImageFilesTest(unittest.TestCase):
         self.assertCountEqual([jpeg_path, gif_path], result)
 
 
+class SetMacOsWallpaperTest(unittest.TestCase):
+    @mock.patch("subprocess.run")
+    def test_sets_wallpaper_on_desktop_1_only(self, mock_run):
+        mock_run.side_effect = [
+            mock.Mock(stdout="2\n"),  # 2 desktops connected
+            mock.Mock(returncode=0),   # osascript wallpaper setting call
+        ]
+
+        test_image = Path("/tmp/apod_today.jpg")
+        apod.set_macos_wallpaper(test_image, desktop_1_only=True)
+
+        self.assertEqual(mock_run.call_count, 2)
+        call_args = mock_run.call_args_list[1]
+        cmd = call_args[0][0]
+        self.assertEqual(cmd[0], "osascript")
+        self.assertEqual(cmd[1], "-e")
+        self.assertIn("set picture of desktop 1 to imagePath", cmd[2])
+        self.assertNotIn("desktopIndex", cmd[2])
+        self.assertEqual(cmd[3], str(test_image))
+
+    @mock.patch.object(apod, "pick_cache_images")
+    @mock.patch("subprocess.run")
+    def test_sets_wallpaper_on_all_desktops_by_default(self, mock_run, mock_pick):
+        mock_run.side_effect = [
+            mock.Mock(stdout="2\n"),  # 2 desktops connected
+            mock.Mock(returncode=0),   # osascript wallpaper setting call
+        ]
+        cached_fallback = Path("/tmp/cached_photo.jpg")
+        mock_pick.return_value = [cached_fallback]
+
+        test_image = Path("/tmp/apod_today.jpg")
+        apod.set_macos_wallpaper(test_image, desktop_1_only=False)
+
+        self.assertEqual(mock_run.call_count, 2)
+        call_args = mock_run.call_args_list[1]
+        cmd = call_args[0][0]
+        self.assertEqual(cmd[0], "osascript")
+        self.assertEqual(cmd[1], "-e")
+        self.assertIn("desktopIndex", cmd[2])
+        self.assertEqual(cmd[3], str(test_image))
+        self.assertEqual(cmd[4], str(cached_fallback))
+
+
+class GetCurrentDesktopWallpaperTest(unittest.TestCase):
+    @mock.patch("subprocess.run")
+    def test_returns_current_wallpaper_path(self, mock_run):
+        mock_run.return_value = mock.Mock(stdout="/path/to/apod.jpg\n", returncode=0)
+        wallpaper = apod.get_current_desktop_1_wallpaper()
+        self.assertEqual(Path("/path/to/apod.jpg"), wallpaper)
+
+    @mock.patch("subprocess.run", side_effect=Exception("AppleScript error"))
+    def test_returns_none_on_error(self, _mock_run):
+        self.assertIsNone(apod.get_current_desktop_1_wallpaper())
+
+
+class MainAlreadyUpToDateTest(unittest.TestCase):
+    @mock.patch.object(apod, "fetch_apod_with_fallback")
+    @mock.patch.object(apod, "get_current_desktop_1_wallpaper")
+    @mock.patch.object(apod, "cached_image_files")
+    def test_skips_fetch_when_already_set(self, mock_cached, mock_current, mock_fetch):
+        today = apod.datetime.now().strftime("%Y-%m-%d")
+        today_image = Path(f"/tmp/apod_{today}.jpg")
+        mock_cached.return_value = [today_image]
+        mock_current.return_value = today_image
+
+        with mock.patch("sys.argv", ["nasa_apod_wallpaper.py"]):
+            apod.main()
+
+        mock_fetch.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
+
