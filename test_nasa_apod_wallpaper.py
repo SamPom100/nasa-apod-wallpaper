@@ -229,6 +229,171 @@ class MainAlreadyUpToDateTest(unittest.TestCase):
         mock_fetch.assert_not_called()
 
 
+class PickRandomCachedWallpaperTest(unittest.TestCase):
+    def test_returns_none_when_cache_is_empty(self):
+        with mock.patch.object(apod, "cached_image_files", return_value=[]):
+            result = apod.pick_random_cached_wallpaper()
+            self.assertIsNone(result)
+
+    def test_picks_older_candidates_excluding_today(self):
+        today_file = Path("/tmp/apod_2026-09-09.jpg")
+        older_file = Path("/tmp/apod_2026-09-07.jpg")
+        with mock.patch.object(
+            apod,
+            "cached_image_files",
+            return_value=[today_file, older_file],
+        ):
+            result = apod.pick_random_cached_wallpaper(exclude_date="2026-09-09")
+            self.assertEqual(older_file, result)
+
+    def test_excludes_currently_set_wallpaper(self):
+        file1 = Path("/tmp/apod_2026-09-07.jpg")
+        file2 = Path("/tmp/apod_2026-09-08.jpg")
+        with mock.patch.object(
+            apod,
+            "cached_image_files",
+            return_value=[file1, file2],
+        ):
+            result = apod.pick_random_cached_wallpaper(
+                exclude_paths=[file2],
+                exclude_date="2026-09-09",
+            )
+            self.assertEqual(file1, result)
+
+    def test_returns_current_wallpaper_if_only_candidate(self):
+        file1 = Path("/tmp/apod_2026-09-08.jpg")
+        with mock.patch.object(
+            apod,
+            "cached_image_files",
+            return_value=[file1],
+        ):
+            result = apod.pick_random_cached_wallpaper(
+                exclude_paths=[file1],
+                exclude_date="2026-09-09",
+            )
+            self.assertEqual(file1, result)
+
+
+class MainFallbackTest(unittest.TestCase):
+    @mock.patch.object(apod, "send_notification")
+    @mock.patch.object(apod, "set_macos_wallpaper")
+    @mock.patch.object(apod, "pick_random_cached_wallpaper")
+    @mock.patch.object(apod, "fetch_apod_with_fallback")
+    @mock.patch.object(apod, "get_current_desktop_1_wallpaper", return_value=None)
+    @mock.patch.object(apod, "cached_image_files", return_value=[])
+    def test_falls_back_to_cache_when_media_type_is_video(
+        self,
+        _mock_cached,
+        _mock_current,
+        mock_fetch,
+        mock_pick_random,
+        mock_set_wallpaper,
+        mock_notify,
+    ):
+        video_data = {
+            "title": "Witness XZ Andromedae Wink",
+            "date": "2026-09-09",
+            "media_type": "video",
+            "url": "https://apod.nasa.gov/apod/image/2609/xz_and.mp4",
+            "explanation": "Do stars wink?",
+        }
+        mock_fetch.return_value = video_data
+        fallback_path = Path("/tmp/apod_2026-09-07.jpg")
+        mock_pick_random.return_value = fallback_path
+
+        with mock.patch("sys.argv", ["nasa_apod_wallpaper.py"]):
+            apod.main()
+
+        mock_pick_random.assert_called_once()
+        mock_set_wallpaper.assert_called_once_with(fallback_path, desktop_1_only=mock.ANY)
+        mock_notify.assert_called_once()
+        self.assertIn("Witness XZ Andromedae Wink", mock_notify.call_args[0][0])
+        self.assertIn("Cached", mock_notify.call_args[0][0])
+
+    @mock.patch.object(apod, "send_notification")
+    @mock.patch.object(apod, "set_macos_wallpaper")
+    @mock.patch.object(apod, "pick_random_cached_wallpaper")
+    @mock.patch.object(apod, "download_apod_image", return_value=None)
+    @mock.patch.object(apod, "fetch_apod_with_fallback")
+    @mock.patch.object(apod, "get_current_desktop_1_wallpaper", return_value=None)
+    @mock.patch.object(apod, "cached_image_files", return_value=[])
+    def test_falls_back_to_cache_when_download_fails(
+        self,
+        _mock_cached,
+        _mock_current,
+        mock_fetch,
+        _mock_download,
+        mock_pick_random,
+        mock_set_wallpaper,
+        mock_notify,
+    ):
+        image_data = {
+            "title": "Cosmic Cloud",
+            "date": "2026-09-09",
+            "media_type": "image",
+            "hdurl": "https://example.com/hd.jpg",
+            "explanation": "A vast nebula.",
+        }
+        mock_fetch.return_value = image_data
+        fallback_path = Path("/tmp/apod_2026-09-07.jpg")
+        mock_pick_random.return_value = fallback_path
+
+        with mock.patch("sys.argv", ["nasa_apod_wallpaper.py"]):
+            apod.main()
+
+        mock_pick_random.assert_called_once()
+        mock_set_wallpaper.assert_called_once_with(fallback_path, desktop_1_only=mock.ANY)
+        mock_notify.assert_called_once()
+        self.assertIn("Cosmic Cloud", mock_notify.call_args[0][0])
+        self.assertIn("Cached", mock_notify.call_args[0][0])
+
+    @mock.patch.object(apod, "send_notification")
+    @mock.patch.object(apod, "set_macos_wallpaper")
+    @mock.patch.object(apod, "pick_random_cached_wallpaper")
+    @mock.patch.object(apod, "fetch_apod_with_fallback", return_value=None)
+    @mock.patch.object(apod, "get_current_desktop_1_wallpaper", return_value=None)
+    @mock.patch.object(apod, "cached_image_files", return_value=[])
+    def test_falls_back_to_cache_when_fetch_returns_none(
+        self,
+        _mock_cached,
+        _mock_current,
+        _mock_fetch,
+        mock_pick_random,
+        mock_set_wallpaper,
+        mock_notify,
+    ):
+        fallback_path = Path("/tmp/apod_2026-09-07.jpg")
+        mock_pick_random.return_value = fallback_path
+
+        with mock.patch("sys.argv", ["nasa_apod_wallpaper.py"]):
+            apod.main()
+
+        mock_pick_random.assert_called_once()
+        mock_set_wallpaper.assert_called_once_with(fallback_path, desktop_1_only=mock.ANY)
+        mock_notify.assert_called_once()
+
+    @mock.patch.object(apod, "pick_random_cached_wallpaper", return_value=None)
+    @mock.patch.object(apod, "fetch_apod_with_fallback")
+    @mock.patch.object(apod, "get_current_desktop_1_wallpaper", return_value=None)
+    @mock.patch.object(apod, "cached_image_files", return_value=[])
+    def test_exits_when_fallback_has_no_cached_images(
+        self,
+        _mock_cached,
+        _mock_current,
+        mock_fetch,
+        _mock_pick_random,
+    ):
+        mock_fetch.return_value = {
+            "title": "Video APOD",
+            "date": "2026-09-09",
+            "media_type": "video",
+        }
+        with mock.patch("sys.argv", ["nasa_apod_wallpaper.py"]):
+            with self.assertRaises(SystemExit) as cm:
+                apod.main()
+            self.assertEqual(cm.exception.code, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 

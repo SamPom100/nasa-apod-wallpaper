@@ -134,29 +134,33 @@ class ApodPageParser(HTMLParser):
             self.current_link = None
 
 
-def fetch_apod_data(date=None, exit_on_error=True):
+def fetch_apod_data(date=None, exit_on_error=True, max_attempts=FETCH_ATTEMPTS):
     """Fetch the APOD metadata from NASA API. Returns data dict, or None on failure if exit_on_error=False."""
     url = APOD_API_URL
     if date:
         url += f"&date={date}"
 
-    for attempt in range(1, FETCH_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         try:
-            print(f"Fetching NASA APOD data{f' for {date}' if date else ''}...")
+            print(f"Fetching NASA APOD data{f' for {date}' if date else ''}...", flush=True)
             with urllib.request.urlopen(url, timeout=10) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as e:
-            print(f"HTTP Error {e.code}: {e.reason}")
-            retry = e.code in {429, 500, 502, 503, 504}
+            print(f"HTTP Error {e.code}: {e.reason}", flush=True)
+            if e.code == 429:
+                print("Rate limit reached on NASA API. Skipping retries to use cache fallback.", flush=True)
+                retry = False
+            else:
+                retry = e.code in {500, 502, 503, 504}
         except urllib.error.URLError as e:
-            print(f"Error fetching APOD data: {e}")
+            print(f"Error fetching APOD data: {e}", flush=True)
             retry = True
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            print(f"Unexpected error: {e}", flush=True)
             retry = True
 
-        if retry and attempt < FETCH_ATTEMPTS:
-            print(f"Retrying in {FETCH_RETRY_DELAY_SECONDS} seconds...")
+        if retry and attempt < max_attempts:
+            print(f"Retrying in {FETCH_RETRY_DELAY_SECONDS} seconds...", flush=True)
             time.sleep(FETCH_RETRY_DELAY_SECONDS)
             continue
 
@@ -165,10 +169,10 @@ def fetch_apod_data(date=None, exit_on_error=True):
         return None
 
 
-def fetch_apod_with_fallback(date=None):
+def fetch_apod_with_fallback(date=None, exit_on_error=True):
     """Fetch APOD data with fallback to yesterday if today isn't available"""
     if date:
-        return fetch_apod_data(date)
+        return fetch_apod_data(date, exit_on_error=exit_on_error)
 
     today = datetime.now().strftime('%Y-%m-%d')
     data = fetch_apod_data(today, exit_on_error=False)
@@ -177,7 +181,7 @@ def fetch_apod_with_fallback(date=None):
 
     yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     print(f"Could not fetch today's APOD, fetching yesterday ({yesterday})...")
-    return fetch_apod_data(yesterday)
+    return fetch_apod_data(yesterday, exit_on_error=exit_on_error)
 
 
 def download_image(url, filename, exit_on_error=True):
@@ -269,6 +273,44 @@ def pick_cache_images(exclude_path, count):
         ]
     random.shuffle(candidates)
     return candidates[:count]
+
+
+def pick_random_cached_wallpaper(exclude_paths=None, exclude_date=None):
+    """Pick a random cached APOD image, preferring older ones not currently displayed."""
+    candidates = cached_image_files()
+    if not candidates:
+        return None
+
+    if exclude_date is None:
+        exclude_date = datetime.now().strftime('%Y-%m-%d')
+
+    try:
+        target_dt = datetime.strptime(exclude_date, '%Y-%m-%d')
+
+        def is_older(p):
+            try:
+                p_date_str = p.stem.replace("apod_", "")
+                return datetime.strptime(p_date_str, '%Y-%m-%d') < target_dt
+            except ValueError:
+                return not p.stem.startswith(f"apod_{exclude_date}")
+
+        older_candidates = [p for p in candidates if is_older(p)]
+    except ValueError:
+        date_prefix = f"apod_{exclude_date}"
+        older_candidates = [p for p in candidates if not p.stem.startswith(date_prefix)]
+
+    if older_candidates:
+        candidates = older_candidates
+
+    if exclude_paths:
+        if isinstance(exclude_paths, (str, Path)):
+            exclude_paths = [exclude_paths]
+        exclude_resolved = {Path(p).resolve() for p in exclude_paths if p is not None}
+        filtered = [p for p in candidates if p.resolve() not in exclude_resolved]
+        if filtered:
+            candidates = filtered
+
+    return random.choice(candidates)
 
 
 def set_macos_wallpaper(image_path, desktop_1_only=False):
@@ -403,9 +445,9 @@ def cleanup_old_images(keep_count=30):
 
 def backfill(days):
     """Download the last N days of APODs without setting wallpaper or notifying."""
-    print("=" * 60)
-    print(f"NASA APOD Backfill - last {days} days")
-    print("=" * 60)
+    print("=" * 60, flush=True)
+    print(f"NASA APOD Backfill - last {days} days", flush=True)
+    print("=" * 60, flush=True)
 
     downloaded = 0
     skipped_existing = 0
@@ -421,33 +463,44 @@ def backfill(days):
             if path.stem == f"apod_{date_str}"
         ]
         if existing:
+            print(f"  {date_str}: already cached", flush=True)
             skipped_existing += 1
             continue
 
-        data = fetch_apod_data(date_str, exit_on_error=False)
-        if data is None:
-            failed += 1
-            continue
+        # Try API first without retrying repeatedly if rate-limited
+        data = fetch_apod_data(date_str, exit_on_error=False, max_attempts=1)
+        if data is not None:
+            if data.get('media_type') != 'image':
+                print(f"  {date_str}: skipping ({data.get('media_type')})", flush=True)
+                skipped_video += 1
+                continue
 
-        if data.get('media_type') != 'image':
-            print(f"  {date_str}: skipping ({data.get('media_type')})")
-            skipped_video += 1
-            continue
+            result = download_apod_image(data, date_str, exit_on_error=False)
+            if result is not None:
+                downloaded += 1
+                continue
 
-        result = download_apod_image(data, date_str, exit_on_error=False)
-        if result is None:
-            failed += 1
+        # Fallback to APOD website directly if API is unavailable, rate-limited, or failed
+        page_url = fetch_apod_page_image_url(date_str)
+        if page_url:
+            filename = f"apod_{date_str}{image_extension(page_url)}"
+            result = download_image(page_url, filename, exit_on_error=False)
+            if result is not None:
+                downloaded += 1
+            else:
+                failed += 1
         else:
-            downloaded += 1
+            print(f"  {date_str}: skipping (non-image or unavailable)", flush=True)
+            skipped_video += 1
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 60, flush=True)
     print(f"Backfill complete: {downloaded} downloaded, "
           f"{skipped_existing} already cached, "
           f"{skipped_video} non-image, "
-          f"{failed} failed")
-    print("=" * 60)
+          f"{failed} failed", flush=True)
+    print("=" * 60, flush=True)
 
-    cleanup_old_images(keep_count=30)
+    cleanup_old_images(keep_count=max(30, days))
 
 
 def get_current_desktop_1_wallpaper():
@@ -482,11 +535,24 @@ def main():
     elif "--all-desktops" in sys.argv:
         desktop_1_only = False
 
+    # Shuffle / Random cached wallpaper mode
+    if "--shuffle" in sys.argv or "--random" in sys.argv:
+        print("\nPicking a random wallpaper from the cache...")
+        current_wallpaper = get_current_desktop_1_wallpaper()
+        image_path = pick_random_cached_wallpaper(exclude_paths=[current_wallpaper])
+        if image_path is None:
+            print("Error: No cached wallpapers available.")
+            sys.exit(1)
+        print(f"Selected cached wallpaper: {image_path.name}")
+        set_macos_wallpaper(image_path, desktop_1_only=desktop_1_only)
+        send_notification(f"NASA APOD (Shuffled: {image_path.name})", f"Set {image_path.name} as wallpaper.")
+        return
+
     # Check for --force flag
     force_update = "--force" in sys.argv
     args = [
         arg for arg in sys.argv[1:]
-        if arg not in ("--force", "--desktop-1-only", "--all-desktops")
+        if arg not in ("--force", "--desktop-1-only", "--all-desktops", "--shuffle", "--random")
     ]
 
     # Get date from command line argument if provided
@@ -509,39 +575,77 @@ def main():
             return
 
     # Fetch APOD data (with fallback to yesterday if today isn't available)
-    apod_data = fetch_apod_with_fallback(date)
+    apod_data = fetch_apod_with_fallback(date, exit_on_error=False)
 
-    # Display info about today's APOD
-    print(f"\nTitle: {apod_data.get('title', 'N/A')}")
-    print(f"Date: {apod_data.get('date', 'N/A')}")
-    print(f"Media Type: {apod_data.get('media_type', 'N/A')}")
+    image_path = None
+    target_date = date or today_str
 
-    # Check if it's an image (not a video)
-    if apod_data.get('media_type') != 'image':
-        print("\nToday's APOD is not an image (it might be a video).")
-        print(f"URL: {apod_data.get('url', 'N/A')}")
-        print("Cannot set as wallpaper. Please try again tomorrow!")
-        sys.exit(0)
+    if apod_data is not None:
+        # Display info about APOD
+        print(f"\nTitle: {apod_data.get('title', 'N/A')}")
+        print(f"Date: {apod_data.get('date', 'N/A')}")
+        print(f"Media Type: {apod_data.get('media_type', 'N/A')}")
 
-    date_str = apod_data.get('date', datetime.now().strftime('%Y-%m-%d'))
+        target_date = apod_data.get('date', target_date)
 
-    image_path = download_apod_image(apod_data, date_str, exit_on_error=False)
-    cleanup_old_images(keep_count=30)
+        # Check if it's an image (not a video)
+        if apod_data.get('media_type') == 'image':
+            image_path = download_apod_image(apod_data, target_date, exit_on_error=False)
+            if image_path is None:
+                print("Could not download today's APOD image.")
+        else:
+            prefix = "The requested" if date else "Today's"
+            print(f"\n{prefix} APOD is not an image (it might be a video).")
+            print(f"URL: {apod_data.get('url', 'N/A')}")
+    else:
+        print(f"Could not fetch APOD data{f' for {date}' if date else ''}.")
 
+    used_cached_fallback = False
     if image_path is None:
-        print("The wallpaper was not changed.")
-        sys.exit(1)
+        print("\nPicking an older random wallpaper from the cache...")
+        current_wallpaper = get_current_desktop_1_wallpaper()
+        image_path = pick_random_cached_wallpaper(
+            exclude_paths=[current_wallpaper],
+            exclude_date=target_date,
+        )
+        if image_path is None:
+            print("Error: No cached wallpapers available to use as fallback.")
+            print("The wallpaper was not changed.")
+            sys.exit(1)
+        used_cached_fallback = True
+        print(f"Selected cached wallpaper: {image_path.name}")
+    else:
+        cleanup_old_images(keep_count=30)
 
     set_macos_wallpaper(image_path, desktop_1_only=desktop_1_only)
 
-    title = apod_data.get('title', 'NASA APOD')
-    description = apod_data.get('explanation', '')
-    send_notification(title, description)
+    if used_cached_fallback:
+        if apod_data and apod_data.get('media_type') != 'image':
+            title = f"{apod_data.get('title', 'NASA APOD')} (Video - Cached Wallpaper)"
+            description = apod_data.get('explanation') or f"Today's APOD is not an image. Set {image_path.name} from cache."
+        elif apod_data:
+            title = f"{apod_data.get('title', 'NASA APOD')} (Cached Wallpaper)"
+            description = apod_data.get('explanation') or f"Download failed. Set {image_path.name} from cache."
+        else:
+            title = f"NASA APOD (Cached: {image_path.name})"
+            description = "Could not fetch APOD. Set a random wallpaper from cache."
 
-    print("\n" + "=" * 60)
-    print("Description:")
-    print(apod_data.get('explanation', 'N/A'))
-    print("=" * 60)
+        send_notification(title, description)
+
+        if apod_data and apod_data.get('explanation'):
+            print("\n" + "=" * 60)
+            print("Description:")
+            print(apod_data.get('explanation'))
+            print("=" * 60)
+    else:
+        title = apod_data.get('title', 'NASA APOD')
+        description = apod_data.get('explanation', '')
+        send_notification(title, description)
+
+        print("\n" + "=" * 60)
+        print("Description:")
+        print(apod_data.get('explanation', 'N/A'))
+        print("=" * 60)
 
 
 if __name__ == "__main__":

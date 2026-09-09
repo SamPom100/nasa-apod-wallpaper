@@ -13,7 +13,7 @@ Automatically set NASA's Astronomy Picture of the Day as your macOS desktop wall
 - 💻 Automatically sets as macOS desktop background
 - 📅 Can fetch images from specific dates
 - ⏰ Optional daily auto-update via LaunchAgent
-- 🧠 Smart fallback: tries today, uses yesterday if not available yet
+- 🧠 Smart fallback: tries today, uses yesterday if not available yet, or selects a random cached wallpaper if today's APOD fails or is a video
 - 🧹 Auto-cleanup keeps only the last 30 wallpapers
 - 🔔 System notifications with image title and description
 - 📝 Shows full image details in terminal
@@ -47,6 +47,16 @@ python3 nasa_apod_wallpaper.py
 Get APOD from a specific date:
 ```bash
 python3 nasa_apod_wallpaper.py 2024-12-25
+```
+
+Shuffle to a random cached wallpaper:
+```bash
+python3 nasa_apod_wallpaper.py --shuffle
+```
+
+Backfill previous wallpapers to cache:
+```bash
+python3 nasa_apod_wallpaper.py --backfill 30
 ```
 
 ## Installation
@@ -110,8 +120,8 @@ rm -rf ~/.nasa_apod_wallpapers/
 ### "Today's APOD not available yet"
 The NASA API can be unreliable when fetching the current day's image. The script automatically falls back to yesterday's image if today's fails. This ensures the script always works reliably.
 
-### "Today's APOD is not an image"
-Sometimes NASA posts videos instead of images. The script will notify you and skip setting the wallpaper.
+### "Today's APOD is not an image" or Download Fails
+Sometimes NASA posts videos instead of images, or the image download fails. When this happens, the script automatically picks an older random wallpaper from your local cache (avoiding the one currently displayed) and sets it so your desktop background still refreshes.
 
 ### Check Logs
 ```bash
