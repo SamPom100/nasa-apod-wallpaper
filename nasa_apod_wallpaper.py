@@ -25,6 +25,7 @@ CONFIG_FILE = WALLPAPER_DIR / "config.json"
 
 FETCH_ATTEMPTS = 6
 FETCH_RETRY_DELAY_SECONDS = 60
+DOWNLOAD_TIMEOUT_SECONDS = 30
 DESKTOP_ATTEMPTS = 3
 DESKTOP_RETRY_DELAY_SECONDS = 5
 IMAGE_EXTENSIONS = {
@@ -191,7 +192,8 @@ def download_image(url, filename, exit_on_error=True):
 
     try:
         print(f"Downloading image from: {url}")
-        urllib.request.urlretrieve(url, temporary_path)
+        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+            temporary_path.write_bytes(response.read())
         temporary_path.replace(filepath)
 
         print(f"Image saved to: {filepath}")
@@ -563,15 +565,14 @@ def main():
 
     today_str = datetime.now().strftime('%Y-%m-%d')
 
-    # If running for today without --force, check if already downloaded & set
     if date is None and not force_update:
-        current_wallpaper = get_current_desktop_1_wallpaper()
-        today_files = [
-            path for path in cached_image_files()
-            if path.stem == f"apod_{today_str}"
-        ]
-        if today_files and current_wallpaper and today_files[0].resolve() == current_wallpaper.resolve():
-            print(f"Today's APOD ({today_str}) is already set as Desktop 1 wallpaper.")
+        cached_image = next(
+            (path for path in cached_image_files() if path.stem == f"apod_{today_str}"),
+            None,
+        )
+        if cached_image is not None:
+            print(f"Using the cached APOD for {today_str}.")
+            set_macos_wallpaper(cached_image, desktop_1_only=desktop_1_only)
             return
 
     # Fetch APOD data (with fallback to yesterday if today isn't available)

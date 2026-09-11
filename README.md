@@ -59,6 +59,26 @@ Backfill previous wallpapers to cache:
 python3 nasa_apod_wallpaper.py --backfill 30
 ```
 
+### Refresh After Laptop Wake
+
+If the daily LaunchAgent is absent, enable it through `./setup.sh`.
+Then install the wake listener:
+
+```bash
+./install_wake.sh
+```
+
+The listener requests an update when the display wakes.
+This includes a display wake after you open the laptop lid.
+
+The updater refreshes all desktops by default and respects the `desktop_1_only` configuration.
+If today's image is cached, the updater reuses it without a download.
+Otherwise, the updater fetches today's APOD through the existing workflow.
+
+The listener uses the existing daily LaunchAgent.
+It cannot start a second updater while that task runs.
+The installer requires the Xcode Command Line Tools and preserves the daily schedule.
+
 ## Installation
 
 ### Method 1: Simple (No auto-update)
@@ -101,6 +121,7 @@ export NASA_API_KEY="your_key_here"
 - **Downloaded images**: `~/.nasa_apod_wallpapers/`
 - **Configuration**: `~/.nasa_apod_wallpapers/config.json`
 - **Logs**: `~/.nasa_apod_wallpapers/apod.log`
+- **Wake listener log**: `~/.nasa_apod_wallpapers/wake.log`
 
 **Note:** The script automatically keeps only the 30 most recent wallpapers to save disk space.
 
@@ -108,6 +129,8 @@ export NASA_API_KEY="your_key_here"
 
 ```bash
 # Remove LaunchAgent
+launchctl bootout gui/$(id -u)/com.nasa.apod.wallpaper.wake
+rm -f ~/Library/LaunchAgents/com.nasa.apod.wallpaper.wake.plist
 launchctl unload ~/Library/LaunchAgents/com.nasa.apod.wallpaper.plist
 rm ~/Library/LaunchAgents/com.nasa.apod.wallpaper.plist
 
@@ -134,6 +157,7 @@ tail -f ~/.nasa_apod_wallpapers/apod.log
 - Python 3.6+
 - Internet connection
 - Free NASA API key
+- Xcode Command Line Tools for optional updates after display wake
 
 ## How It Works
 

@@ -1,3 +1,4 @@
+import io
 import os
 import tempfile
 import unittest
@@ -82,13 +83,10 @@ class DownloadApodImageTest(unittest.TestCase):
                 "WALLPAPER_DIR",
                 Path(temporary_directory),
             ):
-                def write_image(_url, path):
-                    Path(path).write_bytes(b"image")
-
                 with mock.patch.object(
                     apod.urllib.request,
-                    "urlretrieve",
-                    side_effect=write_image,
+                    "urlopen",
+                    return_value=io.BytesIO(b"image"),
                 ):
                     result = apod.download_image(
                         "https://example.com/image.jpeg",
@@ -214,19 +212,20 @@ class GetCurrentDesktopWallpaperTest(unittest.TestCase):
 
 
 class MainAlreadyUpToDateTest(unittest.TestCase):
+    @mock.patch.object(apod, "load_config", return_value={})
+    @mock.patch.object(apod, "set_macos_wallpaper")
     @mock.patch.object(apod, "fetch_apod_with_fallback")
-    @mock.patch.object(apod, "get_current_desktop_1_wallpaper")
     @mock.patch.object(apod, "cached_image_files")
-    def test_skips_fetch_when_already_set(self, mock_cached, mock_current, mock_fetch):
+    def test_skips_fetch_when_already_set(self, mock_cached, mock_fetch, mock_set, _mock_config):
         today = apod.datetime.now().strftime("%Y-%m-%d")
         today_image = Path(f"/tmp/apod_{today}.jpg")
         mock_cached.return_value = [today_image]
-        mock_current.return_value = today_image
 
         with mock.patch("sys.argv", ["nasa_apod_wallpaper.py"]):
             apod.main()
 
         mock_fetch.assert_not_called()
+        mock_set.assert_called_once_with(today_image, desktop_1_only=False)
 
 
 class PickRandomCachedWallpaperTest(unittest.TestCase):
@@ -394,6 +393,87 @@ class MainFallbackTest(unittest.TestCase):
             self.assertEqual(cm.exception.code, 1)
 
 
+class CachedWallpaperRefreshTest(unittest.TestCase):
+    def test_reapplies_cached_today_to_all_desktops_without_network(self):
+        today = apod.datetime.now().strftime("%Y-%m-%d")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            today_image = directory / f"apod_{today}.jpg"
+            other_image = directory / "apod_2000-01-01.jpg"
+            today_image.touch()
+            other_image.touch()
+
+            with mock.patch.object(apod, "WALLPAPER_DIR", directory), \
+                    mock.patch.object(apod, "load_config", return_value={}), \
+                    mock.patch.object(apod, "fetch_apod_with_fallback") as fetch, \
+                    mock.patch.object(apod, "send_notification") as notify, \
+                    mock.patch.object(apod.subprocess, "run") as run, \
+                    mock.patch("sys.argv", ["nasa_apod_wallpaper.py"]):
+                run.side_effect = [mock.Mock(stdout="2\n"), mock.Mock()]
+                apod.main()
+
+            fetch.assert_not_called()
+            notify.assert_not_called()
+            self.assertEqual(
+                [str(today_image), str(other_image)],
+                run.call_args_list[1].args[0][3:],
+            )
+
+    def test_fetches_today_when_only_older_images_are_cached(self):
+        today = apod.datetime.now().strftime("%Y-%m-%d")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            (directory / "apod_2000-01-01.jpg").touch()
+            today_image = directory / f"apod_{today}.jpg"
+
+            with mock.patch.object(apod, "WALLPAPER_DIR", directory), \
+                    mock.patch.object(apod, "load_config", return_value={}), \
+                    mock.patch.object(apod, "fetch_apod_with_fallback") as fetch, \
+                    mock.patch.object(apod, "download_apod_image", return_value=today_image), \
+                    mock.patch.object(apod, "set_macos_wallpaper") as set_wallpaper, \
+                    mock.patch.object(apod, "send_notification"), \
+                    mock.patch("sys.argv", ["nasa_apod_wallpaper.py"]):
+                fetch.return_value = {"media_type": "image", "date": today}
+                apod.main()
+
+            fetch.assert_called_once_with(None, exit_on_error=False)
+            set_wallpaper.assert_called_once_with(today_image, desktop_1_only=False)
+
+    def test_cached_refresh_respects_desktop_selection(self):
+        today = apod.datetime.now().strftime("%Y-%m-%d")
+        today_image = Path(f"/tmp/apod_{today}.jpg")
+        for config, args, expected in [
+            ({}, ["--desktop-1-only"], True),
+            ({"desktop_1_only": True}, [], True),
+            ({"desktop_1_only": True}, ["--all-desktops"], False),
+        ]:
+            with self.subTest(config=config, args=args):
+                with mock.patch.object(apod, "load_config", return_value=config), \
+                        mock.patch.object(apod, "cached_image_files", return_value=[today_image]), \
+                        mock.patch.object(apod, "fetch_apod_with_fallback") as fetch, \
+                        mock.patch.object(apod, "set_macos_wallpaper") as set_wallpaper, \
+                        mock.patch("sys.argv", ["nasa_apod_wallpaper.py", *args]):
+                    apod.main()
+                fetch.assert_not_called()
+                set_wallpaper.assert_called_once_with(today_image, desktop_1_only=expected)
+
+    def test_explicit_refresh_bypasses_today_cache(self):
+        today = apod.datetime.now().strftime("%Y-%m-%d")
+        today_image = Path(f"/tmp/apod_{today}.jpg")
+        for argument, expected_date in [("--force", None), (today, today)]:
+            with self.subTest(argument=argument):
+                with mock.patch.object(apod, "load_config", return_value={}), \
+                        mock.patch.object(apod, "cached_image_files", return_value=[today_image]), \
+                        mock.patch.object(apod, "fetch_apod_with_fallback") as fetch, \
+                        mock.patch.object(apod, "download_apod_image", return_value=today_image) as download, \
+                        mock.patch.object(apod, "set_macos_wallpaper"), \
+                        mock.patch.object(apod, "send_notification"), \
+                        mock.patch("sys.argv", ["nasa_apod_wallpaper.py", argument]):
+                    fetch.return_value = {"media_type": "image", "date": today}
+                    apod.main()
+                fetch.assert_called_once_with(expected_date, exit_on_error=False)
+                download.assert_called_once_with(fetch.return_value, today, exit_on_error=False)
+
+
 if __name__ == "__main__":
     unittest.main()
-
