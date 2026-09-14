@@ -194,6 +194,8 @@ def download_image(url, filename, exit_on_error=True):
         print(f"Downloading image from: {url}")
         with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
             temporary_path.write_bytes(response.read())
+        if not is_valid_image(temporary_path):
+            raise ValueError("The download is not a valid image")
         temporary_path.replace(filepath)
 
         print(f"Image saved to: {filepath}")
@@ -257,11 +259,30 @@ def download_apod_image(apod_data, date_str, exit_on_error=True):
     return None
 
 
+def is_valid_image(path):
+    try:
+        result = subprocess.run(
+            ['/usr/bin/sips', '-g', 'pixelWidth', '-g', 'pixelHeight', str(path)],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        dimensions = [
+            line.split(':', 1)[1].strip()
+            for line in result.stdout.splitlines()
+            if line.strip().startswith(('pixelWidth:', 'pixelHeight:'))
+        ]
+        return len(dimensions) == 2 and all(
+            value.isdecimal() and int(value) > 0 for value in dimensions
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def cached_image_files():
     """Return cached APOD image files."""
     return [
         path for path in WALLPAPER_DIR.glob("apod_*")
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        and is_valid_image(path)
     ]
 
 
@@ -420,7 +441,10 @@ def send_notification(title, description):
 def cleanup_old_images(keep_count=30):
     """Remove old APOD images, keeping only the most recent ones"""
     try:
-        image_files = cached_image_files()
+        image_files = [
+            path for path in WALLPAPER_DIR.glob("apod_*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ]
 
         if len(image_files) <= keep_count:
             return  # Nothing to clean up
@@ -455,16 +479,13 @@ def backfill(days):
     skipped_existing = 0
     skipped_video = 0
     failed = 0
+    cached_dates = {path.stem for path in cached_image_files()}
 
     for offset in range(days):
         date_str = (datetime.now() - timedelta(days=offset)).strftime('%Y-%m-%d')
 
         # Skip dates we already have cached (any extension)
-        existing = [
-            path for path in cached_image_files()
-            if path.stem == f"apod_{date_str}"
-        ]
-        if existing:
+        if f"apod_{date_str}" in cached_dates:
             print(f"  {date_str}: already cached", flush=True)
             skipped_existing += 1
             continue

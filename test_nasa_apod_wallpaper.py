@@ -1,3 +1,4 @@
+import base64
 import io
 import os
 import tempfile
@@ -8,6 +9,17 @@ from unittest import mock
 os.environ.setdefault("NASA_API_KEY", "test-key")
 
 import nasa_apod_wallpaper as apod
+
+
+JPEG_IMAGE = base64.b64decode(
+    '/9j/wAALCAABAAEBAREA/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgED'
+    'AwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcY'
+    'GRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJ'
+    'ipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo'
+    '6erx8vP09fb3+Pn6/9sAQwACAgICAgIDAgIDBQMDAwUGBQUFBQYIBgYGBgYICggICAgICAoKCgoK'
+    'CgoKDAwMDAwMDg4ODg4PDw8PDw8PDw8P/90ABAAB/9oACAEBAAA/APwDr//Z'
+)
+GIF_IMAGE = base64.b64decode('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7')
 
 
 class DownloadApodImageTest(unittest.TestCase):
@@ -86,14 +98,45 @@ class DownloadApodImageTest(unittest.TestCase):
                 with mock.patch.object(
                     apod.urllib.request,
                     "urlopen",
-                    return_value=io.BytesIO(b"image"),
+                    return_value=io.BytesIO(JPEG_IMAGE),
                 ):
                     result = apod.download_image(
                         "https://example.com/image.jpeg",
                         "apod_2026-08-20.jpeg",
                     )
 
-            self.assertEqual(b"image", result.read_bytes())
+            self.assertEqual(JPEG_IMAGE, result.read_bytes())
+
+    def test_rejects_invalid_downloads_without_replacing_cached_image(self):
+        for content in (b'<html>Service unavailable</html>', b'', JPEG_IMAGE[:20]):
+            with self.subTest(content=content):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    directory = Path(temporary_directory)
+                    image = directory / 'apod_2026-09-14.jpg'
+                    image.write_bytes(JPEG_IMAGE)
+                    with mock.patch.object(apod, 'WALLPAPER_DIR', directory), \
+                            mock.patch.object(apod.urllib.request, 'urlopen', return_value=io.BytesIO(content)):
+                        result = apod.download_image(
+                            'https://example.com/image.jpg', image.name, exit_on_error=False,
+                        )
+
+                    self.assertIsNone(result)
+                    self.assertEqual(JPEG_IMAGE, image.read_bytes())
+                    self.assertFalse(image.with_suffix('.jpg.download').exists())
+
+    def test_uses_website_when_hd_response_is_not_an_image(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            with mock.patch.object(apod, 'WALLPAPER_DIR', directory), \
+                    mock.patch.object(apod, 'fetch_apod_page_image_url', return_value='https://example.com/full.jpg'), \
+                    mock.patch.object(apod.urllib.request, 'urlopen', side_effect=[
+                        io.BytesIO(b'<html>Service unavailable</html>'), io.BytesIO(JPEG_IMAGE),
+                    ]):
+                result = apod.download_apod_image(
+                    {'hdurl': 'https://example.com/broken.jpg'}, '2026-09-14',
+                )
+
+            self.assertEqual(JPEG_IMAGE, result.read_bytes())
 
     def test_returns_none_when_all_urls_fail(self):
         data = {
@@ -142,8 +185,8 @@ class CachedImageFilesTest(unittest.TestCase):
             jpeg_path = wallpaper_directory / "apod_2026-08-14.jpeg"
             gif_path = wallpaper_directory / "apod_2026-08-05.gif"
             ignored_path = wallpaper_directory / "apod.log"
-            jpeg_path.touch()
-            gif_path.touch()
+            jpeg_path.write_bytes(JPEG_IMAGE)
+            gif_path.write_bytes(GIF_IMAGE)
             ignored_path.touch()
 
             with mock.patch.object(
@@ -154,6 +197,25 @@ class CachedImageFilesTest(unittest.TestCase):
                 result = apod.cached_image_files()
 
         self.assertCountEqual([jpeg_path, gif_path], result)
+
+    def test_cleanup_counts_invalid_files_toward_cache_limit(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            invalid = directory / 'apod_2000-01-01.jpg'
+            valid = directory / 'apod_2000-01-02.jpg'
+            incomplete = directory / 'apod_2000-01-03.jpg.download'
+            invalid.write_text('<html>Error</html>')
+            valid.write_bytes(JPEG_IMAGE)
+            incomplete.write_bytes(b'incomplete')
+            os.utime(invalid, (1, 1))
+            os.utime(valid, (2, 2))
+
+            with mock.patch.object(apod, 'WALLPAPER_DIR', directory):
+                apod.cleanup_old_images(keep_count=1)
+
+            self.assertFalse(invalid.exists())
+            self.assertEqual(JPEG_IMAGE, valid.read_bytes())
+            self.assertTrue(incomplete.exists())
 
 
 class SetMacOsWallpaperTest(unittest.TestCase):
@@ -400,10 +462,11 @@ class CachedWallpaperRefreshTest(unittest.TestCase):
             directory = Path(temporary_directory)
             today_image = directory / f"apod_{today}.jpg"
             other_image = directory / "apod_2000-01-01.jpg"
-            today_image.touch()
-            other_image.touch()
+            today_image.write_bytes(JPEG_IMAGE)
+            other_image.write_bytes(JPEG_IMAGE)
 
             with mock.patch.object(apod, "WALLPAPER_DIR", directory), \
+                    mock.patch.object(apod, "is_valid_image", return_value=True), \
                     mock.patch.object(apod, "load_config", return_value={}), \
                     mock.patch.object(apod, "fetch_apod_with_fallback") as fetch, \
                     mock.patch.object(apod, "send_notification") as notify, \
@@ -423,7 +486,7 @@ class CachedWallpaperRefreshTest(unittest.TestCase):
         today = apod.datetime.now().strftime("%Y-%m-%d")
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
-            (directory / "apod_2000-01-01.jpg").touch()
+            (directory / "apod_2000-01-01.jpg").write_bytes(JPEG_IMAGE)
             today_image = directory / f"apod_{today}.jpg"
 
             with mock.patch.object(apod, "WALLPAPER_DIR", directory), \
@@ -438,6 +501,51 @@ class CachedWallpaperRefreshTest(unittest.TestCase):
 
             fetch.assert_called_once_with(None, exit_on_error=False)
             set_wallpaper.assert_called_once_with(today_image, desktop_1_only=False)
+
+    def test_replaces_invalid_cached_today_and_notifies_with_description(self):
+        today = apod.datetime.now().strftime('%Y-%m-%d')
+        data = {
+            'date': today,
+            'media_type': 'image',
+            'hdurl': 'https://example.com/image.jpg',
+            'title': 'A distant galaxy',
+            'explanation': 'This galaxy contains billions of stars.',
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            image = directory / f'apod_{today}.jpg'
+            image.write_text('<html>Service unavailable</html>')
+            with mock.patch.object(apod, 'WALLPAPER_DIR', directory), \
+                    mock.patch.object(apod, 'load_config', return_value={}), \
+                    mock.patch.object(apod, 'fetch_apod_with_fallback', return_value=data) as fetch, \
+                    mock.patch.object(apod.urllib.request, 'urlopen', return_value=io.BytesIO(JPEG_IMAGE)), \
+                    mock.patch.object(apod, 'set_macos_wallpaper') as set_wallpaper, \
+                    mock.patch.object(apod, 'send_notification') as notify, \
+                    mock.patch('sys.argv', ['nasa_apod_wallpaper.py']):
+                apod.main()
+
+            self.assertEqual(JPEG_IMAGE, image.read_bytes())
+            fetch.assert_called_once_with(None, exit_on_error=False)
+            set_wallpaper.assert_called_once_with(image, desktop_1_only=False)
+            notify.assert_called_once_with(data['title'], data['explanation'])
+
+    def test_uses_valid_older_image_when_today_cache_is_invalid_and_api_fails(self):
+        today = apod.datetime.now().strftime('%Y-%m-%d')
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            (directory / f'apod_{today}.jpg').write_text('<html>Error</html>')
+            older_image = directory / 'apod_2000-01-01.jpg'
+            older_image.write_bytes(JPEG_IMAGE)
+            with mock.patch.object(apod, 'WALLPAPER_DIR', directory), \
+                    mock.patch.object(apod, 'load_config', return_value={}), \
+                    mock.patch.object(apod, 'fetch_apod_with_fallback', return_value=None), \
+                    mock.patch.object(apod, 'get_current_desktop_1_wallpaper', return_value=None), \
+                    mock.patch.object(apod, 'set_macos_wallpaper') as set_wallpaper, \
+                    mock.patch.object(apod, 'send_notification'), \
+                    mock.patch('sys.argv', ['nasa_apod_wallpaper.py']):
+                apod.main()
+
+            set_wallpaper.assert_called_once_with(older_image, desktop_1_only=False)
 
     def test_cached_refresh_respects_desktop_selection(self):
         today = apod.datetime.now().strftime("%Y-%m-%d")

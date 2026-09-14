@@ -1,5 +1,7 @@
 import AppKit
 
+let app = NSApplication.shared
+app.setActivationPolicy(.prohibited)
 let notifications = NSWorkspace.shared.notificationCenter
 let observer = notifications.addObserver(
     forName: NSWorkspace.screensDidWakeNotification,
@@ -24,4 +26,4 @@ let observer = notifications.addObserver(
 }
 
 NSLog("The wallpaper wake listener is ready.")
-RunLoop.main.run()
+app.run()
