@@ -260,14 +260,53 @@ class SetMacOsWallpaperTest(unittest.TestCase):
         self.assertEqual(cmd[3], str(test_image))
         self.assertEqual(cmd[4], str(cached_fallback))
 
+    @mock.patch.object(apod, "is_desktop_1_active", return_value=False)
+    @mock.patch.object(apod, "set_desktop_1_in_store", return_value=True)
+    @mock.patch("subprocess.run")
+    def test_sets_wallpaper_in_store_when_desktop_1_inactive(self, mock_run, mock_set_store, _mock_active):
+        mock_run.return_value = mock.Mock(stdout="2\n")
+        test_image = Path("/tmp/apod_today.jpg")
+        apod.set_macos_wallpaper(test_image, desktop_1_only=True)
+
+        mock_set_store.assert_called_once_with(test_image)
+        # Should only call count of desktops, not set picture of desktop 1
+        self.assertEqual(mock_run.call_count, 1)
+
 
 class GetCurrentDesktopWallpaperTest(unittest.TestCase):
+    def test_reads_from_wallpaper_store(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_file = Path(temp_dir) / "Index.plist"
+            data = {
+                "Spaces": {
+                    "": {
+                        "Default": {
+                            "Desktop": {
+                                "Content": {
+                                    "Choices": [
+                                        {"Files": [{"relative": "file:///path/to/store_apod.jpg"}]}
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            with open(store_file, "wb") as f:
+                apod.plistlib.dump(data, f)
+
+            with mock.patch.object(apod, "WALLPAPER_STORE_INDEX", store_file):
+                wallpaper = apod.get_current_desktop_1_wallpaper()
+                self.assertEqual(Path("/path/to/store_apod.jpg"), wallpaper)
+
+    @mock.patch.object(apod, "WALLPAPER_STORE_INDEX", Path("/nonexistent/Index.plist"))
     @mock.patch("subprocess.run")
     def test_returns_current_wallpaper_path(self, mock_run):
         mock_run.return_value = mock.Mock(stdout="/path/to/apod.jpg\n", returncode=0)
         wallpaper = apod.get_current_desktop_1_wallpaper()
         self.assertEqual(Path("/path/to/apod.jpg"), wallpaper)
 
+    @mock.patch.object(apod, "WALLPAPER_STORE_INDEX", Path("/nonexistent/Index.plist"))
     @mock.patch("subprocess.run", side_effect=Exception("AppleScript error"))
     def test_returns_none_on_error(self, _mock_run):
         self.assertIsNone(apod.get_current_desktop_1_wallpaper())
@@ -558,12 +597,26 @@ class CachedWallpaperRefreshTest(unittest.TestCase):
             with self.subTest(config=config, args=args):
                 with mock.patch.object(apod, "load_config", return_value=config), \
                         mock.patch.object(apod, "cached_image_files", return_value=[today_image]), \
+                        mock.patch.object(apod, "get_current_desktop_1_wallpaper", return_value=None), \
                         mock.patch.object(apod, "fetch_apod_with_fallback") as fetch, \
                         mock.patch.object(apod, "set_macos_wallpaper") as set_wallpaper, \
                         mock.patch("sys.argv", ["nasa_apod_wallpaper.py", *args]):
                     apod.main()
                 fetch.assert_not_called()
                 set_wallpaper.assert_called_once_with(today_image, desktop_1_only=expected)
+
+    def test_cached_refresh_skips_when_desktop_1_already_set(self):
+        today = apod.datetime.now().strftime("%Y-%m-%d")
+        today_image = Path(f"/tmp/apod_{today}.jpg")
+        with mock.patch.object(apod, "load_config", return_value={"desktop_1_only": True}), \
+                mock.patch.object(apod, "cached_image_files", return_value=[today_image]), \
+                mock.patch.object(apod, "get_current_desktop_1_wallpaper", return_value=today_image), \
+                mock.patch.object(apod, "fetch_apod_with_fallback") as fetch, \
+                mock.patch.object(apod, "set_macos_wallpaper") as set_wallpaper, \
+                mock.patch("sys.argv", ["nasa_apod_wallpaper.py"]):
+            apod.main()
+        fetch.assert_not_called()
+        set_wallpaper.assert_not_called()
 
     def test_explicit_refresh_bypasses_today_cache(self):
         today = apod.datetime.now().strftime("%Y-%m-%d")
