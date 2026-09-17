@@ -31,4 +31,4 @@ PY
 
 /bin/launchctl bootout "$USER_DOMAIN/com.nasa.apod.wallpaper.wake" 2>/dev/null || true
 /bin/launchctl bootstrap "$USER_DOMAIN" "$LAUNCHAGENT_PATH"
-echo "Wallpaper updates on display wake and screen unlock are enabled."
+echo "Wallpaper updates after wake, unlock, and display changes are enabled."

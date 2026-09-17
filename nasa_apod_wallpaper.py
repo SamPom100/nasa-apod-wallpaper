@@ -6,6 +6,7 @@ Fetches the Astronomy Picture of the Day and sets it as macOS desktop background
 
 import os
 import sys
+import copy
 import json
 import plistlib
 import random
@@ -16,6 +17,7 @@ import urllib.parse
 from html.parser import HTMLParser
 from pathlib import Path
 import subprocess
+import tempfile
 from datetime import datetime, timedelta
 
 # Directory to store downloaded wallpapers and config
@@ -24,7 +26,6 @@ WALLPAPER_DIR.mkdir(exist_ok=True)
 
 CONFIG_FILE = WALLPAPER_DIR / "config.json"
 WALLPAPER_STORE_INDEX = Path.home() / "Library/Application Support/com.apple.wallpaper/Store/Index.plist"
-SPACES_PLIST = Path.home() / "Library/Preferences/com.apple.spaces.plist"
 
 FETCH_ATTEMPTS = 6
 FETCH_RETRY_DELAY_SECONDS = 60
@@ -291,7 +292,8 @@ def cached_image_files():
 
 def pick_cache_images(exclude_path, count):
     """Pick distinct cached APOD images, excluding the given path."""
-    candidates = cached_image_files()
+    today = datetime.now().strftime('%Y-%m-%d')
+    candidates = [path for path in cached_image_files() if path.stem != f'apod_{today}']
     if exclude_path is not None:
         candidates = [
             path for path in candidates
@@ -339,111 +341,118 @@ def pick_random_cached_wallpaper(exclude_paths=None, exclude_date=None):
     return random.choice(candidates)
 
 
-def is_desktop_1_active():
-    """Return True if Desktop 1 is currently active."""
-    if SPACES_PLIST.exists():
-        try:
-            with open(SPACES_PLIST, "rb") as f:
-                d = plistlib.load(f)
-            for m in d.get("SpacesDisplayConfiguration", {}).get("Management Data", {}).get("Monitors", []):
-                if m.get("Display Identifier") == "Main":
-                    current_uuid = m.get("Current Space", {}).get("uuid")
-                    spaces = m.get("Spaces", [])
-                    if spaces:
-                        first_uuid = spaces[0].get("uuid")
-                        return current_uuid == first_uuid
-        except Exception:
-            pass
-    return True
+def get_desktop_contexts():
+    script = '''
+    ObjC.import('Foundation');
+    ObjC.import('ColorSync');
+    var displayUUIDs = Application('System Events').desktops().map(function (display) {
+        var uuid = $.CGDisplayCreateUUIDFromDisplayID(display.id());
+        return ObjC.unwrap(ObjC.castRefToObject($.CFUUIDCreateString(null, uuid)));
+    });
+    var prefs = ObjC.deepUnwrap(
+        $.NSUserDefaults.standardUserDefaults.persistentDomainForName('com.apple.spaces')
+    );
+    JSON.stringify({
+        display_uuids: displayUUIDs,
+        monitors: prefs.SpacesDisplayConfiguration['Management Data'].Monitors
+    });
+    '''
+    try:
+        result = subprocess.run(
+            ['/usr/bin/osascript', '-l', 'JavaScript', '-e', script],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        data = json.loads(result.stdout)
+        contexts = []
+        for display_uuid in data['display_uuids']:
+            monitor = None
+            for identifier in (display_uuid, 'Main'):
+                monitor = next((
+                    item for item in data['monitors']
+                    if item.get('Display Identifier') == identifier and item.get('Spaces')
+                ), None)
+                if monitor is not None:
+                    break
+            if monitor is None:
+                raise ValueError('A display has no Space information')
+            normal_spaces = [space for space in monitor['Spaces'] if space.get('type', 0) == 0]
+            if not normal_spaces:
+                raise ValueError('A display has no normal desktops')
+            for space in normal_spaces:
+                context = {
+                    'display_uuid': display_uuid,
+                    'space_uuid': space['uuid'],
+                    'current_space_uuid': monitor['Current Space']['uuid'],
+                }
+                if not display_uuid or not all(isinstance(value, str) for value in context.values()):
+                    raise ValueError('The desktop identifiers are invalid')
+                contexts.append(context)
+        return contexts
+    except Exception as error:
+        print(f"Cannot identify the desktops: {error}")
+    return []
 
 
-def set_desktop_1_in_store(image_path):
-    """Update Desktop 1 (Space 1) wallpaper in modern macOS wallpaper store."""
-    if not WALLPAPER_STORE_INDEX.exists():
+def set_wallpapers_in_store(assignments):
+    if not assignments or not WALLPAPER_STORE_INDEX.exists():
         return False
+    temporary_path = None
     try:
         with open(WALLPAPER_STORE_INDEX, "rb") as f:
             data = plistlib.load(f)
-        file_url = Path(image_path).resolve().as_uri()
-        spaces = data.get("Spaces", {})
-        first_space = spaces.get("", {})
-        if not first_space and spaces:
-            first_space = next(iter(spaces.values()))
-
-        if "Default" in first_space and "Desktop" in first_space["Default"]:
-            for choice in first_space["Default"]["Desktop"].get("Content", {}).get("Choices", []):
-                choice["Files"] = [{"relative": file_url}]
-                choice["Provider"] = "com.apple.wallpaper.choice.image"
-        for d_id, d_data in first_space.get("Displays", {}).items():
-            if "Desktop" in d_data:
-                for choice in d_data["Desktop"].get("Content", {}).get("Choices", []):
-                    choice["Files"] = [{"relative": file_url}]
-                    choice["Provider"] = "com.apple.wallpaper.choice.image"
-
-        with open(WALLPAPER_STORE_INDEX, "wb") as f:
-            plistlib.dump(data, f)
-        subprocess.run(["killall", "WallpaperAgent"], check=False)
+        for context, image_path in assignments:
+            space = data['Spaces'][context['space_uuid']]
+            display = copy.deepcopy(space.get('Displays', {}).get(context['display_uuid'], {}))
+            desktop = display.get('Desktop') or copy.deepcopy(space.get('Default', {}).get('Desktop'))
+            if not desktop or not desktop.get('Content', {}).get('Choices'):
+                return False
+            desktop['Content']['Choices'] = [{
+                'Provider': 'com.apple.wallpaper.choice.image',
+                'Files': [],
+                'Configuration': plistlib.dumps({
+                    'type': 'imageFile',
+                    'url': {'relative': Path(image_path).resolve().as_uri()},
+                }, fmt=plistlib.FMT_BINARY),
+            }]
+            display['Desktop'] = desktop
+            space.setdefault('Displays', {})[context['display_uuid']] = display
+        contents = plistlib.dumps(data, fmt=plistlib.FMT_BINARY)
+        with tempfile.NamedTemporaryFile(dir=WALLPAPER_STORE_INDEX.parent, delete=False) as f:
+            temporary_path = Path(f.name)
+            os.fchmod(f.fileno(), WALLPAPER_STORE_INDEX.stat().st_mode & 0o777)
+            f.write(contents)
+        temporary_path.replace(WALLPAPER_STORE_INDEX)
+        subprocess.run(['/usr/bin/killall', 'WallpaperAgent'], check=False, timeout=10)
         return True
-    except Exception:
+    except Exception as error:
+        print(f"Cannot update the wallpaper store: {error}")
         return False
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def set_macos_wallpaper(image_path, desktop_1_only=False):
     """Set the macOS desktop wallpaper (desktop 1 only, or all desktops)."""
-    if desktop_1_only:
-        script = '''
-        on run argv
-            set imagePath to item 1 of argv
-            tell application "System Events"
-                set picture of desktop 1 to imagePath
-            end tell
-        end run
-        '''
-    else:
-        script = '''
-        on run imagePaths
-            tell application "System Events"
-                repeat with desktopIndex from 1 to count of imagePaths
-                    set picture of desktop desktopIndex to item desktopIndex of imagePaths
-                end repeat
-            end tell
-        end run
-        '''
-
     for attempt in range(1, DESKTOP_ATTEMPTS + 1):
         try:
-            result = subprocess.run(
-                ['osascript', '-e', 'tell application "System Events" to count of desktops'],
-                check=True, capture_output=True, text=True
-            )
-            desktop_count = int(result.stdout.strip())
-            if desktop_count < 1:
+            contexts = get_desktop_contexts()
+            if not contexts:
                 raise RuntimeError("No macOS desktops are available")
-
-            if desktop_1_only:
-                if not is_desktop_1_active():
-                    if set_desktop_1_in_store(image_path):
-                        print(f"Desktop 1: {Path(image_path).name}")
-                        return
-                subprocess.run(
-                    ['osascript', '-e', script, str(image_path)],
-                    check=True, capture_output=True, text=True
-                )
-                print(f"Desktop 1: {Path(image_path).name}")
-            else:
-                assignments = [str(image_path)]
-                cached_images = pick_cache_images(image_path, desktop_count - 1)
-                assignments.extend(str(cached) for cached in cached_images)
-                assignments.extend(
-                    str(image_path) for _ in range(desktop_count - len(assignments))
-                )
-
-                subprocess.run(
-                    ['osascript', '-e', script, *assignments],
-                    check=True, capture_output=True, text=True
-                )
-                for idx, path in enumerate(assignments, start=1):
-                    print(f"Desktop {idx}: {Path(path).name}")
+            assignments = [(contexts[0], image_path)]
+            if not desktop_1_only and len(contexts) > 1:
+                cached_images = pick_cache_images(image_path, len(contexts) - 1)
+                if cached_images:
+                    assignments.extend(
+                        (context, cached_images[index % len(cached_images)])
+                        for index, context in enumerate(contexts[1:])
+                    )
+                else:
+                    print("No other cached image is available. Other desktops keep their wallpaper.")
+            if not set_wallpapers_in_store(assignments):
+                raise RuntimeError("The wallpaper store update failed")
+            for index, (_, path) in enumerate(assignments, start=1):
+                print(f"Desktop {index}: {Path(path).name}")
             return
         except (subprocess.CalledProcessError, RuntimeError, ValueError) as e:
             if attempt < DESKTOP_ATTEMPTS:
@@ -584,19 +593,30 @@ def backfill(days):
 
 def get_current_desktop_1_wallpaper():
     """Return the Path to the current wallpaper set on desktop 1, or None."""
+    contexts = get_desktop_contexts()
+    if not contexts:
+        return None
+    context = contexts[0]
     if WALLPAPER_STORE_INDEX.exists():
         try:
             with open(WALLPAPER_STORE_INDEX, "rb") as f:
                 data = plistlib.load(f)
-            first_space = data.get("Spaces", {}).get("", {})
-            choices = first_space.get("Default", {}).get("Desktop", {}).get("Content", {}).get("Choices", [])
-            if choices and choices[0].get("Files"):
-                rel = choices[0]["Files"][0].get("relative")
-                if rel and rel.startswith("file://"):
-                    return Path(urllib.parse.unquote(urllib.parse.urlparse(rel).path))
+            space = data['Spaces'][context['space_uuid']]
+            desktop = space.get('Displays', {}).get(context['display_uuid'], {}).get('Desktop')
+            desktop = desktop or space.get('Default', {}).get('Desktop', {})
+            choices = desktop.get('Content', {}).get('Choices', [])
+            if choices:
+                configuration = plistlib.loads(choices[0]['Configuration'])
+                if configuration.get('type') != 'imageFile':
+                    return None
+                url = urllib.parse.urlparse(configuration['url']['relative'])
+                if url.scheme == 'file':
+                    return Path(urllib.parse.unquote(url.path))
         except Exception:
             pass
 
+    if context['space_uuid'] != context['current_space_uuid']:
+        return None
     try:
         result = subprocess.run(
             ['osascript', '-e', 'tell application "System Events" to get picture of desktop 1'],

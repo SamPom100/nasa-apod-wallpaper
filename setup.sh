@@ -39,7 +39,7 @@ if [ -z "$SKIP_API_KEY" ]; then
     echo "3. Copy your API key"
     echo ""
 
-    read -p "Enter your NASA API key: " API_KEY
+    read -r -p "Enter your NASA API key: " API_KEY
 
     if [ -z "$API_KEY" ]; then
         echo "Error: API key cannot be empty"
@@ -47,7 +47,20 @@ if [ -z "$SKIP_API_KEY" ]; then
     fi
 
     # Save API key to config
-    echo "{\"api_key\": \"$API_KEY\"}" > "$CONFIG_FILE"
+    APOD_SETUP_API_KEY="$API_KEY" python3 - "$CONFIG_FILE" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+config = json.loads(path.read_text()) if path.exists() else {}
+if not isinstance(config, dict):
+    raise ValueError("The configuration must be a JSON object.")
+config['api_key'] = os.environ['APOD_SETUP_API_KEY']
+path.write_text(json.dumps(config, indent=2) + '\n')
+path.chmod(0o600)
+PY
     echo ""
     echo "✓ API key saved to $CONFIG_FILE"
 fi

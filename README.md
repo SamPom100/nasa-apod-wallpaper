@@ -59,7 +59,7 @@ Backfill previous wallpapers to cache:
 python3 nasa_apod_wallpaper.py --backfill 30
 ```
 
-### Refresh After Laptop Wake or Unlock
+### Refresh After Laptop Wake, Unlock, or Display Changes
 
 If the daily LaunchAgent is absent, enable it through `./setup.sh`.
 Then install the wake listener:
@@ -68,16 +68,20 @@ Then install the wake listener:
 ./install_wake.sh
 ```
 
-The listener requests an update when the display wakes or the screen unlocks.
+The listener requests an update when the display wakes, the screen unlocks, or the display configuration changes.
 This includes a display wake after you open the laptop lid.
 After a locked wake, the unlock event gives the updater another chance to access the desktops.
+Display changes also trigger an update when an external monitor connects or becomes available.
+The listener waits five seconds after the last event so that the display configuration can settle.
 
-The updater refreshes all desktops by default and respects the `desktop_1_only` configuration.
+Today's APOD goes only to Desktop 1, the first normal Space on the first display.
+Other desktops receive random cached images, including other Spaces on the same display.
+The `desktop_1_only` configuration limits updates to Desktop 1.
 If today's image is cached, the updater reuses it without a download.
 Otherwise, the updater fetches today's APOD through the existing workflow.
 
 The listener uses the existing daily LaunchAgent.
-It cannot start a second updater while that task runs.
+If that updater is active, the listener retains the request and retries after the updater exits.
 The installer requires the Xcode Command Line Tools and preserves the daily schedule.
 
 To update an existing installation, run these commands from the repository:

@@ -11,6 +11,20 @@ os.environ.setdefault("NASA_API_KEY", "test-key")
 import nasa_apod_wallpaper as apod
 
 
+def setUpModule():
+    directory = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(directory.cleanup)
+    root = Path(directory.name)
+    for name, path in [
+        ('WALLPAPER_DIR', root),
+        ('CONFIG_FILE', root / 'config.json'),
+        ('WALLPAPER_STORE_INDEX', root / 'Index.plist'),
+    ]:
+        patch = mock.patch.object(apod, name, path)
+        patch.start()
+        unittest.addModuleCleanup(patch.stop)
+
+
 JPEG_IMAGE = base64.b64decode(
     '/9j/wAALCAABAAEBAREA/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgED'
     'AwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcY'
@@ -219,61 +233,34 @@ class CachedImageFilesTest(unittest.TestCase):
 
 
 class SetMacOsWallpaperTest(unittest.TestCase):
-    @mock.patch("subprocess.run")
-    def test_sets_wallpaper_on_desktop_1_only(self, mock_run):
-        mock_run.side_effect = [
-            mock.Mock(stdout="2\n"),  # 2 desktops connected
-            mock.Mock(returncode=0),   # osascript wallpaper setting call
-        ]
+    def test_primary_only_targets_space_1_while_space_2_is_active(self):
+        contexts = [{'display_uuid': 'primary', 'space_uuid': space, 'current_space_uuid': 'space-2'}
+                    for space in ('space-1', 'space-2')]
+        image = Path('/tmp/apod_today.jpg')
+        with mock.patch.object(apod, 'get_desktop_contexts', return_value=contexts), \
+                mock.patch.object(apod, 'set_wallpapers_in_store', return_value=True) as write, \
+                mock.patch.object(apod, 'pick_cache_images') as pick:
+            apod.set_macos_wallpaper(image, desktop_1_only=True)
+        write.assert_called_once_with([(contexts[0], image)])
+        pick.assert_not_called()
 
-        test_image = Path("/tmp/apod_today.jpg")
-        apod.set_macos_wallpaper(test_image, desktop_1_only=True)
-
-        self.assertEqual(mock_run.call_count, 2)
-        call_args = mock_run.call_args_list[1]
-        cmd = call_args[0][0]
-        self.assertEqual(cmd[0], "osascript")
-        self.assertEqual(cmd[1], "-e")
-        self.assertIn("set picture of desktop 1 to imagePath", cmd[2])
-        self.assertNotIn("desktopIndex", cmd[2])
-        self.assertEqual(cmd[3], str(test_image))
-
-    @mock.patch.object(apod, "pick_cache_images")
-    @mock.patch("subprocess.run")
-    def test_sets_wallpaper_on_all_desktops_by_default(self, mock_run, mock_pick):
-        mock_run.side_effect = [
-            mock.Mock(stdout="2\n"),  # 2 desktops connected
-            mock.Mock(returncode=0),   # osascript wallpaper setting call
-        ]
-        cached_fallback = Path("/tmp/cached_photo.jpg")
-        mock_pick.return_value = [cached_fallback]
-
-        test_image = Path("/tmp/apod_today.jpg")
-        apod.set_macos_wallpaper(test_image, desktop_1_only=False)
-
-        self.assertEqual(mock_run.call_count, 2)
-        call_args = mock_run.call_args_list[1]
-        cmd = call_args[0][0]
-        self.assertEqual(cmd[0], "osascript")
-        self.assertEqual(cmd[1], "-e")
-        self.assertIn("desktopIndex", cmd[2])
-        self.assertEqual(cmd[3], str(test_image))
-        self.assertEqual(cmd[4], str(cached_fallback))
-
-    @mock.patch.object(apod, "is_desktop_1_active", return_value=False)
-    @mock.patch.object(apod, "set_desktop_1_in_store", return_value=True)
-    @mock.patch("subprocess.run")
-    def test_sets_wallpaper_in_store_when_desktop_1_inactive(self, mock_run, mock_set_store, _mock_active):
-        mock_run.return_value = mock.Mock(stdout="2\n")
-        test_image = Path("/tmp/apod_today.jpg")
-        apod.set_macos_wallpaper(test_image, desktop_1_only=True)
-
-        mock_set_store.assert_called_once_with(test_image)
-        # Should only call count of desktops, not set picture of desktop 1
-        self.assertEqual(mock_run.call_count, 1)
+    def test_unknown_desktops_do_not_write_any_wallpaper(self):
+        with mock.patch.object(apod, 'get_desktop_contexts', return_value=[]), \
+                mock.patch.object(apod, 'set_wallpapers_in_store') as write, \
+                mock.patch.object(apod.time, 'sleep'):
+            with self.assertRaises(SystemExit):
+                apod.set_macos_wallpaper(Path('/today.jpg'))
+        write.assert_not_called()
 
 
 class GetCurrentDesktopWallpaperTest(unittest.TestCase):
+    def setUp(self):
+        patch = mock.patch.object(apod, 'get_desktop_contexts', return_value=[{
+            'display_uuid': 'primary', 'space_uuid': '', 'current_space_uuid': '',
+        }])
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_reads_from_wallpaper_store(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store_file = Path(temp_dir) / "Index.plist"
@@ -284,7 +271,13 @@ class GetCurrentDesktopWallpaperTest(unittest.TestCase):
                             "Desktop": {
                                 "Content": {
                                     "Choices": [
-                                        {"Files": [{"relative": "file:///path/to/store_apod.jpg"}]}
+                                        {
+                                            'Files': [],
+                                            'Configuration': apod.plistlib.dumps({
+                                                'type': 'imageFile',
+                                                'url': {'relative': 'file:///path/to/store_apod.jpg'},
+                                            }, fmt=apod.plistlib.FMT_BINARY),
+                                        }
                                     ]
                                 }
                             }
@@ -503,23 +496,22 @@ class CachedWallpaperRefreshTest(unittest.TestCase):
             other_image = directory / "apod_2000-01-01.jpg"
             today_image.write_bytes(JPEG_IMAGE)
             other_image.write_bytes(JPEG_IMAGE)
+            contexts = [{'display_uuid': 'primary', 'space_uuid': space, 'current_space_uuid': 'space-2'}
+                        for space in ('space-1', 'space-2')]
 
             with mock.patch.object(apod, "WALLPAPER_DIR", directory), \
                     mock.patch.object(apod, "is_valid_image", return_value=True), \
                     mock.patch.object(apod, "load_config", return_value={}), \
                     mock.patch.object(apod, "fetch_apod_with_fallback") as fetch, \
                     mock.patch.object(apod, "send_notification") as notify, \
-                    mock.patch.object(apod.subprocess, "run") as run, \
+                    mock.patch.object(apod, 'get_desktop_contexts', return_value=contexts), \
+                    mock.patch.object(apod, 'set_wallpapers_in_store', return_value=True) as write, \
                     mock.patch("sys.argv", ["nasa_apod_wallpaper.py"]):
-                run.side_effect = [mock.Mock(stdout="2\n"), mock.Mock()]
                 apod.main()
 
             fetch.assert_not_called()
             notify.assert_not_called()
-            self.assertEqual(
-                [str(today_image), str(other_image)],
-                run.call_args_list[1].args[0][3:],
-            )
+            write.assert_called_once_with([(contexts[0], today_image), (contexts[1], other_image)])
 
     def test_fetches_today_when_only_older_images_are_cached(self):
         today = apod.datetime.now().strftime("%Y-%m-%d")
