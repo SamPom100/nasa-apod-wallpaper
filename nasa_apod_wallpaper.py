@@ -432,8 +432,46 @@ def set_wallpapers_in_store(assignments):
             temporary_path.unlink()
 
 
-def set_macos_wallpaper(image_path, desktop_1_only=False):
+def load_wallpaper_state():
+    try:
+        state = json.loads((WALLPAPER_DIR / 'wallpaper_state.json').read_text())
+        if (not isinstance(state, dict)
+                or not isinstance(state.get('date'), (str, type(None)))
+                or not isinstance(state.get('primary'), (str, type(None)))
+                or not isinstance(state.get('desktops', {}), dict)):
+            raise ValueError('Invalid wallpaper state')
+        for entry in state.get('desktops', {}).values():
+            if (not isinstance(entry, dict)
+                    or not isinstance(entry.get('path'), str)
+                    or not isinstance(entry.get('date'), (str, type(None)))):
+                raise ValueError('Invalid desktop assignment')
+        return state
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as error:
+        print(f"Cannot read the saved wallpaper choices: {error}")
+        return {}
+
+
+def save_wallpaper_state(state):
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=WALLPAPER_DIR, delete=False) as output:
+            temporary_path = Path(output.name)
+            json.dump(state, output, indent=2)
+            output.write('\n')
+        temporary_path.replace(WALLPAPER_DIR / 'wallpaper_state.json')
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def set_macos_wallpaper(image_path, desktop_1_only=False, apod_date=None, shuffle=False):
     """Set the macOS desktop wallpaper (desktop 1 only, or all desktops)."""
+    state = load_wallpaper_state()
+    if apod_date is None:
+        apod_date = state.get('date')
+    desktops = state.setdefault('desktops', {})
     for attempt in range(1, DESKTOP_ATTEMPTS + 1):
         try:
             contexts = get_desktop_contexts()
@@ -441,20 +479,34 @@ def set_macos_wallpaper(image_path, desktop_1_only=False):
                 raise RuntimeError("No macOS desktops are available")
             assignments = [(contexts[0], image_path)]
             if not desktop_1_only and len(contexts) > 1:
-                cached_images = pick_cache_images(image_path, len(contexts) - 1)
+                cached_images = pick_cache_images(image_path, None)
                 if cached_images:
-                    assignments.extend(
-                        (context, cached_images[index % len(cached_images)])
-                        for index, context in enumerate(contexts[1:])
-                    )
+                    candidates = {str(path.resolve()): path for path in cached_images}
+                    used = {entry['path'] for entry in desktops.values()
+                            if not shuffle and entry.get('date') == apod_date
+                            and entry['path'] in candidates}
+                    for context in contexts[1:]:
+                        key = context['display_uuid'] + '/' + context['space_uuid']
+                        previous = desktops.get(key, {})
+                        path = previous.get('path')
+                        if shuffle or previous.get('date') != apod_date or path not in candidates:
+                            available = [item for item in candidates if item not in used and item != path]
+                            available = available or [item for item in candidates if item != path] or list(candidates)
+                            path = available[0]
+                        desktops[key] = {'date': apod_date, 'path': path}
+                        used.add(path)
+                        assignments.append((context, candidates[path]))
                 else:
                     print("No other cached image is available. Other desktops keep their wallpaper.")
+            shuffle = False
             if not set_wallpapers_in_store(assignments):
                 raise RuntimeError("The wallpaper store update failed")
+            state.update(date=apod_date, primary=str(Path(image_path).resolve()))
+            save_wallpaper_state(state)
             for index, (_, path) in enumerate(assignments, start=1):
                 print(f"Desktop {index}: {Path(path).name}")
             return
-        except (subprocess.CalledProcessError, RuntimeError, ValueError) as e:
+        except (OSError, subprocess.CalledProcessError, RuntimeError, ValueError) as e:
             if attempt < DESKTOP_ATTEMPTS:
                 print(f"Could not set the wallpaper: {e}")
                 print(f"Retrying in {DESKTOP_RETRY_DELAY_SECONDS} seconds...")
@@ -647,6 +699,8 @@ def main():
     elif "--all-desktops" in sys.argv:
         desktop_1_only = False
 
+    state = load_wallpaper_state()
+
     # Shuffle / Random cached wallpaper mode
     if "--shuffle" in sys.argv or "--random" in sys.argv:
         print("\nPicking a random wallpaper from the cache...")
@@ -656,7 +710,9 @@ def main():
             print("Error: No cached wallpapers available.")
             sys.exit(1)
         print(f"Selected cached wallpaper: {image_path.name}")
-        set_macos_wallpaper(image_path, desktop_1_only=desktop_1_only)
+        set_macos_wallpaper(image_path, desktop_1_only=desktop_1_only,
+                            apod_date=state.get('date') or datetime.now().strftime('%Y-%m-%d'),
+                            shuffle=True)
         send_notification(f"NASA APOD (Shuffled: {image_path.name})", f"Set {image_path.name} as wallpaper.")
         return
 
@@ -687,14 +743,18 @@ def main():
                     print(f"Today's APOD ({today_str}) is already set as Desktop 1 wallpaper.")
                     return
             print(f"Using the cached APOD for {today_str}.")
-            set_macos_wallpaper(cached_image, desktop_1_only=desktop_1_only)
+            set_macos_wallpaper(cached_image, desktop_1_only=desktop_1_only, apod_date=today_str)
             return
 
     # Fetch APOD data (with fallback to yesterday if today isn't available)
     apod_data = fetch_apod_with_fallback(date, exit_on_error=False)
+    if (date is None and apod_data and state.get('date')
+            and apod_data.get('date', today_str) < state['date']):
+        apod_data = None
 
     image_path = None
     target_date = date or today_str
+    apod_date = apod_data.get('date', target_date) if apod_data else state.get('date')
 
     if apod_data is not None:
         # Display info about APOD
@@ -717,13 +777,20 @@ def main():
         print(f"Could not fetch APOD data{f' for {date}' if date else ''}.")
 
     used_cached_fallback = False
+    reused_fallback = False
     if image_path is None:
-        print("\nPicking an older random wallpaper from the cache...")
-        current_wallpaper = get_current_desktop_1_wallpaper()
-        image_path = pick_random_cached_wallpaper(
-            exclude_paths=[current_wallpaper],
-            exclude_date=target_date,
-        )
+        saved_primary = state.get('primary')
+        if state.get('date') == apod_date and saved_primary:
+            image_path = next((path for path in cached_image_files()
+                               if str(path.resolve()) == saved_primary), None)
+            reused_fallback = image_path is not None
+        if image_path is None:
+            print("\nSelect an older random wallpaper from the cache.")
+            current_wallpaper = get_current_desktop_1_wallpaper()
+            image_path = pick_random_cached_wallpaper(
+                exclude_paths=[current_wallpaper],
+                exclude_date=target_date,
+            )
         if image_path is None:
             print("Error: No cached wallpapers available to use as fallback.")
             print("The wallpaper was not changed.")
@@ -733,7 +800,10 @@ def main():
     else:
         cleanup_old_images(keep_count=30)
 
-    set_macos_wallpaper(image_path, desktop_1_only=desktop_1_only)
+    set_macos_wallpaper(image_path, desktop_1_only=desktop_1_only, apod_date=apod_date)
+
+    if reused_fallback:
+        return
 
     if used_cached_fallback:
         if apod_data and apod_data.get('media_type') != 'image':

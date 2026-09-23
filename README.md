@@ -76,6 +76,16 @@ The listener waits five seconds after the last event so that the display configu
 
 Today's APOD goes only to Desktop 1, the first normal Space on the first display.
 Other desktops receive random cached images, including other Spaces on the same display.
+Each random image stays the same until the updater detects a new APOD date.
+Wake, unlock, and display events reuse the saved choices, including after a restart.
+
+If APOD is a video or its image fails, Desktop 1 also uses a saved random image.
+If NASA is unavailable, the updater keeps the existing choices until it receives a new APOD entry.
+If a saved image disappears from the cache, the updater replaces that image.
+
+`--shuffle` selects new random images immediately. `--force` fetches APOD again and preserves the other desktop choices for that APOD date.
+After `--shuffle`, the next automatic refresh restores APOD on Desktop 1 and keeps the other random choices.
+
 The `desktop_1_only` configuration limits updates to Desktop 1.
 If today's image is cached, the updater reuses it without a download.
 Otherwise, the updater fetches today's APOD through the existing workflow.
@@ -155,10 +165,14 @@ rm -rf ~/.nasa_apod_wallpapers/
 ## Troubleshooting
 
 ### "Today's APOD not available yet"
-The NASA API can be unreliable when fetching the current day's image. The script automatically falls back to yesterday's image if today's fails. This ensures the script always works reliably.
+If NASA does not provide today's entry, the updater tries yesterday's entry.
+The random images change only when the updater receives a new APOD date.
+If both requests fail, the updater reuses its saved choices.
 
 ### "Today's APOD is not an image" or Download Fails
-Sometimes NASA posts videos instead of images, or the image download fails. When this happens, the script automatically picks an older random wallpaper from your local cache (avoiding the one currently displayed) and sets it so your desktop background still refreshes.
+If APOD is a video or its image download fails, the updater selects a random cached image for Desktop 1.
+Repeated refreshes reuse that image and the random choices for other desktops.
+If the image download later succeeds, Desktop 1 uses APOD and the other desktops keep their choices until the next APOD date.
 
 ### Check Logs
 ```bash

@@ -319,7 +319,7 @@ class MainAlreadyUpToDateTest(unittest.TestCase):
             apod.main()
 
         mock_fetch.assert_not_called()
-        mock_set.assert_called_once_with(today_image, desktop_1_only=False)
+        mock_set.assert_called_once_with(today_image, desktop_1_only=False, apod_date=today)
 
 
 class PickRandomCachedWallpaperTest(unittest.TestCase):
@@ -398,7 +398,8 @@ class MainFallbackTest(unittest.TestCase):
             apod.main()
 
         mock_pick_random.assert_called_once()
-        mock_set_wallpaper.assert_called_once_with(fallback_path, desktop_1_only=mock.ANY)
+        mock_set_wallpaper.assert_called_once_with(fallback_path, desktop_1_only=mock.ANY,
+                                                  apod_date=video_data['date'])
         mock_notify.assert_called_once()
         self.assertIn("Witness XZ Andromedae Wink", mock_notify.call_args[0][0])
         self.assertIn("Cached", mock_notify.call_args[0][0])
@@ -435,7 +436,8 @@ class MainFallbackTest(unittest.TestCase):
             apod.main()
 
         mock_pick_random.assert_called_once()
-        mock_set_wallpaper.assert_called_once_with(fallback_path, desktop_1_only=mock.ANY)
+        mock_set_wallpaper.assert_called_once_with(fallback_path, desktop_1_only=mock.ANY,
+                                                  apod_date=image_data['date'])
         mock_notify.assert_called_once()
         self.assertIn("Cosmic Cloud", mock_notify.call_args[0][0])
         self.assertIn("Cached", mock_notify.call_args[0][0])
@@ -462,7 +464,7 @@ class MainFallbackTest(unittest.TestCase):
             apod.main()
 
         mock_pick_random.assert_called_once()
-        mock_set_wallpaper.assert_called_once_with(fallback_path, desktop_1_only=mock.ANY)
+        mock_set_wallpaper.assert_called_once_with(fallback_path, desktop_1_only=mock.ANY, apod_date=None)
         mock_notify.assert_called_once()
 
     @mock.patch.object(apod, "pick_random_cached_wallpaper", return_value=None)
@@ -531,7 +533,7 @@ class CachedWallpaperRefreshTest(unittest.TestCase):
                 apod.main()
 
             fetch.assert_called_once_with(None, exit_on_error=False)
-            set_wallpaper.assert_called_once_with(today_image, desktop_1_only=False)
+            set_wallpaper.assert_called_once_with(today_image, desktop_1_only=False, apod_date=today)
 
     def test_replaces_invalid_cached_today_and_notifies_with_description(self):
         today = apod.datetime.now().strftime('%Y-%m-%d')
@@ -557,7 +559,7 @@ class CachedWallpaperRefreshTest(unittest.TestCase):
 
             self.assertEqual(JPEG_IMAGE, image.read_bytes())
             fetch.assert_called_once_with(None, exit_on_error=False)
-            set_wallpaper.assert_called_once_with(image, desktop_1_only=False)
+            set_wallpaper.assert_called_once_with(image, desktop_1_only=False, apod_date=today)
             notify.assert_called_once_with(data['title'], data['explanation'])
 
     def test_uses_valid_older_image_when_today_cache_is_invalid_and_api_fails(self):
@@ -576,7 +578,7 @@ class CachedWallpaperRefreshTest(unittest.TestCase):
                     mock.patch('sys.argv', ['nasa_apod_wallpaper.py']):
                 apod.main()
 
-            set_wallpaper.assert_called_once_with(older_image, desktop_1_only=False)
+            set_wallpaper.assert_called_once_with(older_image, desktop_1_only=False, apod_date=None)
 
     def test_cached_refresh_respects_desktop_selection(self):
         today = apod.datetime.now().strftime("%Y-%m-%d")
@@ -595,7 +597,7 @@ class CachedWallpaperRefreshTest(unittest.TestCase):
                         mock.patch("sys.argv", ["nasa_apod_wallpaper.py", *args]):
                     apod.main()
                 fetch.assert_not_called()
-                set_wallpaper.assert_called_once_with(today_image, desktop_1_only=expected)
+                set_wallpaper.assert_called_once_with(today_image, desktop_1_only=expected, apod_date=today)
 
     def test_cached_refresh_skips_when_desktop_1_already_set(self):
         today = apod.datetime.now().strftime("%Y-%m-%d")

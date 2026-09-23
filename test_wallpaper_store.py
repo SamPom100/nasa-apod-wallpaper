@@ -90,7 +90,8 @@ class WallpaperStoreTest(unittest.TestCase):
             },
         }, 'SystemDefault': {'keep': True}}
         self.save()
-        for name, value in [('WALLPAPER_STORE_INDEX', self.path),
+        for name, value in [('WALLPAPER_DIR', self.root),
+                            ('WALLPAPER_STORE_INDEX', self.path),
                             ('get_desktop_contexts', mock.Mock(return_value=self.contexts))]:
             patch = mock.patch.object(apod, name, value)
             patch.start()
