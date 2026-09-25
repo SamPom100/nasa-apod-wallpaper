@@ -128,6 +128,17 @@ cp com.nasa.apod.wallpaper.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.nasa.apod.wallpaper.plist
 ```
 
+## iPhone Shortcut
+
+`APOD_Wallpaper.shortcut` sets today's APOD as the iPhone wallpaper. It does not use an API key.
+
+1. AirDrop `APOD_Wallpaper.shortcut` to the iPhone.
+2. Tap **Add Shortcut**.
+3. If iOS asks for a wallpaper, select the wallpaper that the shortcut must replace.
+4. Optional: Add a daily automation in the Shortcuts app that runs the shortcut.
+
+The shortcut reads the image link from the APOD webpage. It downloads the image from `assets.science.nasa.gov`, because NASA is moving APOD to `science.nasa.gov/apod`.
+
 ## Configuration
 
 The script will prompt for your API key on first run and save it to:
