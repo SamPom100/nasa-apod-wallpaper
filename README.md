@@ -215,7 +215,7 @@ More than enough for daily updates!
 
 ## Credits
 
-- Images and data provided by [NASA's APOD](https://apod.nasa.gov/)
+- Images and data provided by [NASA's APOD](https://science.nasa.gov/apod)
 - Built with ❤️ using Python
 
 ## License

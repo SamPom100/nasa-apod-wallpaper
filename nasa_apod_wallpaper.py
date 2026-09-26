@@ -107,6 +107,9 @@ CONFIG = load_config()
 NASA_API_KEY = load_api_key(CONFIG)
 APOD_API_URL = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}"
 APOD_SITE_URL = "https://apod.nasa.gov/apod"
+SCIENCE_NASA_SITE_URL = "https://science.nasa.gov/apod"
+SCIENCE_NASA_ASSETS_URL = "https://assets.science.nasa.gov/content/dam/science/cds/apod/apod"
+SCIENCE_NASA_DYNAMIC_URL = "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod"
 
 
 class ApodPageParser(HTMLParser):
@@ -238,11 +241,33 @@ def fetch_apod_page_image_url(date_str):
     return None
 
 
+def to_science_nasa_urls(url, date_str):
+    """Convert an apod.nasa.gov image URL to assets.science.nasa.gov CDN URLs."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if 'apod.nasa.gov' in parsed.netloc or not parsed.netloc:
+            filename = Path(parsed.path).name
+            if filename:
+                date = datetime.strptime(date_str, '%Y-%m-%d')
+                month = date.strftime('%B').lower()
+                return [
+                    f"{SCIENCE_NASA_ASSETS_URL}/{date.year}/{month}/{filename}",
+                    f"{SCIENCE_NASA_DYNAMIC_URL}/{date.year}/{month}/{filename}?w=4096&fit=clip",
+                ]
+    except Exception:
+        pass
+    return []
+
+
 def download_apod_image(apod_data, date_str, exit_on_error=True):
     """Download the API full-resolution image or its APOD webpage fallback."""
     api_url = apod_data.get('hdurl')
     if api_url:
         filename = f"apod_{date_str}{image_extension(api_url)}"
+        for science_url in to_science_nasa_urls(api_url, date_str):
+            image_path = download_image(science_url, filename, exit_on_error=False)
+            if image_path is not None:
+                return image_path
         image_path = download_image(api_url, filename, exit_on_error=False)
         if image_path is not None:
             return image_path
@@ -253,6 +278,10 @@ def download_apod_image(apod_data, date_str, exit_on_error=True):
     page_url = fetch_apod_page_image_url(date_str)
     if page_url:
         filename = f"apod_{date_str}{image_extension(page_url)}"
+        for science_url in to_science_nasa_urls(page_url, date_str):
+            image_path = download_image(science_url, filename, exit_on_error=False)
+            if image_path is not None:
+                return image_path
         image_path = download_image(page_url, filename, exit_on_error=False)
         if image_path is not None:
             return image_path
@@ -644,7 +673,13 @@ def backfill(days):
         page_url = fetch_apod_page_image_url(date_str)
         if page_url:
             filename = f"apod_{date_str}{image_extension(page_url)}"
-            result = download_image(page_url, filename, exit_on_error=False)
+            result = None
+            for science_url in to_science_nasa_urls(page_url, date_str):
+                result = download_image(science_url, filename, exit_on_error=False)
+                if result is not None:
+                    break
+            if result is None:
+                result = download_image(page_url, filename, exit_on_error=False)
             if result is not None:
                 downloaded += 1
             else:

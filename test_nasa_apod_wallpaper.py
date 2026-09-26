@@ -176,6 +176,42 @@ class DownloadApodImageTest(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_uses_science_nasa_assets_url_when_apod_nasa_gov_is_provided(self):
+        expected_path = Path("/tmp/apod_2026-09-26.jpg")
+        data = {
+            "hdurl": "https://apod.nasa.gov/apod/image/2609/MilkyWayMeteorLSTJeffDai.jpg",
+            "url": "https://apod.nasa.gov/apod/image/2609/MilkyWayMeteorLSTJeffDai1024.jpg",
+        }
+
+        with mock.patch.object(
+            apod,
+            "download_image",
+            return_value=expected_path,
+        ) as download_image:
+            result = apod.download_apod_image(data, "2026-09-26")
+
+        self.assertEqual(expected_path, result)
+        download_image.assert_called_once_with(
+            "https://assets.science.nasa.gov/content/dam/science/cds/apod/apod/2026/september/MilkyWayMeteorLSTJeffDai.jpg",
+            "apod_2026-09-26.jpg",
+            exit_on_error=False,
+        )
+
+
+class ToScienceNasaUrlsTest(unittest.TestCase):
+    def test_converts_apod_nasa_gov_url(self):
+        urls = apod.to_science_nasa_urls(
+            "https://apod.nasa.gov/apod/image/2609/NGC5139CadenasParra.jpg",
+            "2026-09-25",
+        )
+        self.assertEqual([
+            "https://assets.science.nasa.gov/content/dam/science/cds/apod/apod/2026/september/NGC5139CadenasParra.jpg",
+            "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/september/NGC5139CadenasParra.jpg?w=4096&fit=clip",
+        ], urls)
+
+    def test_ignores_non_apod_nasa_gov_urls(self):
+        self.assertEqual([], apod.to_science_nasa_urls("https://example.com/image.jpg", "2026-09-25"))
+
 
 class ApodPageParserTest(unittest.TestCase):
     def test_finds_the_link_around_the_display_image(self):
