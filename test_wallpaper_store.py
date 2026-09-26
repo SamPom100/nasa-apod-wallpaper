@@ -16,7 +16,7 @@ def desktop(image):
         'Content': {
             'Choices': [{
                 'Provider': 'com.apple.wallpaper.choice.image',
-                'Files': [],
+                'Files': [{'relative': Path(image).as_uri()}],
                 'Configuration': plistlib.dumps({
                     'type': 'imageFile', 'url': {'relative': Path(image).as_uri()},
                 }, fmt=plistlib.FMT_BINARY),
@@ -108,7 +108,7 @@ class WallpaperStoreTest(unittest.TestCase):
         self.assertEqual(1, run.call_count)
         updated = plistlib.loads(self.path.read_bytes())
         choices = updated['Spaces']['space-1']['Displays']['primary']['Desktop']['Content']['Choices']
-        self.assertEqual([], choices[0]['Files'])
+        self.assertEqual([{'relative': image.as_uri()}], choices[0]['Files'])
         self.assertEqual(image.as_uri(), plistlib.loads(choices[0]['Configuration'])['url']['relative'])
         expected = copy.deepcopy(self.data)
         expected['Spaces']['space-1']['Displays']['primary']['Desktop']['Content']['Choices'] = choices

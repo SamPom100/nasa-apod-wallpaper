@@ -393,6 +393,15 @@ def get_desktop_contexts():
     return []
 
 
+DEFAULT_WALLPAPER_CONFIGURATION = {
+    'backgroundColor': {
+        'components': [0.2549019607843137, 0.4117647058823529, 0.6666666666666666, 1.0],
+        'colorSpace': b'bplist00_\x10\x17kCGColorSpaceGenericRGB\x08\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"'
+    },
+    'placement': 1,
+}
+
+
 def set_wallpapers_in_store(assignments):
     if not assignments or not WALLPAPER_STORE_INDEX.exists():
         return False
@@ -406,16 +415,27 @@ def set_wallpapers_in_store(assignments):
             desktop = display.get('Desktop') or copy.deepcopy(space.get('Default', {}).get('Desktop'))
             if not desktop or not desktop.get('Content', {}).get('Choices'):
                 return False
+            url = Path(image_path).resolve().as_uri()
+            cfg_dict = copy.deepcopy(DEFAULT_WALLPAPER_CONFIGURATION)
+            existing_choices = desktop.get('Content', {}).get('Choices', [])
+            if existing_choices and existing_choices[0].get('Configuration'):
+                try:
+                    loaded = plistlib.loads(existing_choices[0]['Configuration'])
+                    if isinstance(loaded, dict):
+                        cfg_dict.update(loaded)
+                except Exception:
+                    pass
+            cfg_dict['type'] = 'imageFile'
+            cfg_dict['url'] = {'relative': url}
             desktop['Content']['Choices'] = [{
                 'Provider': 'com.apple.wallpaper.choice.image',
-                'Files': [],
-                'Configuration': plistlib.dumps({
-                    'type': 'imageFile',
-                    'url': {'relative': Path(image_path).resolve().as_uri()},
-                }, fmt=plistlib.FMT_BINARY),
+                'Files': [{'relative': url}],
+                'Configuration': plistlib.dumps(cfg_dict, fmt=plistlib.FMT_BINARY),
             }]
             display['Desktop'] = desktop
             space.setdefault('Displays', {})[context['display_uuid']] = display
+            if 'Displays' in data and context['display_uuid'] in data['Displays']:
+                data['Displays'][context['display_uuid']]['Desktop'] = copy.deepcopy(desktop)
         contents = plistlib.dumps(data, fmt=plistlib.FMT_BINARY)
         with tempfile.NamedTemporaryFile(dir=WALLPAPER_STORE_INDEX.parent, delete=False) as f:
             temporary_path = Path(f.name)
