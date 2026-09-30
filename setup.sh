@@ -160,7 +160,7 @@ EOF
     launchctl load "$LAUNCHAGENT_PATH"
 
     echo ""
-    echo "✓ Daily auto-update enabled (runs at 9:03 AM)"
+    echo "✓ Daily auto-update enabled (runs at 12:30 AM and every 3 hours from 9:03 AM to 9:03 PM)"
     echo "  LaunchAgent installed at: $LAUNCHAGENT_PATH"
 else
     echo "Skipping auto-update setup."

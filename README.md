@@ -1,6 +1,6 @@
 # NASA APOD Wallpaper
 
-![NASA APOD](https://apod.nasa.gov/apod/image/2603/cg4_1024.jpg)
+![NASA APOD](https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/march/cg4.jpg?w=1024)
 
 ## What it does
 

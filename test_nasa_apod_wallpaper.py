@@ -207,8 +207,47 @@ class ToScienceNasaUrlsTest(unittest.TestCase):
         )
         self.assertEqual([
             "https://assets.science.nasa.gov/content/dam/science/cds/apod/apod/2026/september/NGC5139CadenasParra.jpg",
-            "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/september/NGC5139CadenasParra.jpg?w=4096&fit=clip",
         ], urls)
+
+    def test_converts_dynamic_and_rendition_urls_to_the_master(self):
+        master = "https://assets.science.nasa.gov/content/dam/science/cds/apod/apod/2026/october/NGC772_Robert_Eder.jpg"
+        for url in (
+            "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/october/NGC772_Robert_Eder.jpg?w=1772&h=1182&fit=clip",
+            master + "/jcr:content/renditions/cq5dam.web.1280.1280.jpeg",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual([master], apod.to_science_nasa_urls(url, "2026-09-30"))
+
+    def test_never_downloads_from_apod_nasa_gov(self):
+        urls = apod.image_download_urls("https://apod.nasa.gov/apod/image/2609/a.jpg", "2026-09-28")
+        self.assertEqual(
+            ["https://assets.science.nasa.gov/content/dam/science/cds/apod/apod/2026/september/a.jpg"], urls,
+        )
+
+
+class DuplicateImageTest(unittest.TestCase):
+    def test_rejects_a_download_that_matches_another_date(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            (directory / 'apod_2026-09-25.jpg').write_bytes(JPEG_IMAGE)
+            with mock.patch.object(apod, 'WALLPAPER_DIR', directory), \
+                    mock.patch.object(apod.urllib.request, 'urlopen', return_value=io.BytesIO(JPEG_IMAGE)):
+                result = apod.download_image(
+                    'https://example.com/image.jpg', 'apod_2026-09-28.jpg', exit_on_error=False,
+                )
+
+            self.assertIsNone(result)
+            self.assertFalse((directory / 'apod_2026-09-28.jpg').exists())
+
+    def test_allows_replacing_the_same_date(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            (directory / 'apod_2026-09-28.jpg').write_bytes(JPEG_IMAGE)
+            with mock.patch.object(apod, 'WALLPAPER_DIR', directory), \
+                    mock.patch.object(apod.urllib.request, 'urlopen', return_value=io.BytesIO(JPEG_IMAGE)):
+                result = apod.download_image('https://example.com/image.jpg', 'apod_2026-09-28.jpg')
+
+            self.assertEqual(directory / 'apod_2026-09-28.jpg', result)
 
 
 class FetchApodFromFeedTest(unittest.TestCase):
@@ -304,19 +343,43 @@ class FetchApodFromScienceNasaTest(unittest.TestCase):
         self.assertEqual("Peculiar galaxy description.", result["explanation"])
 
 
-class ApodPageParserTest(unittest.TestCase):
-    def test_finds_the_link_around_the_display_image(self):
-        parser = apod.ApodPageParser()
-        parser.feed(
-            '<a href="image/2608/IMG_5201.jpeg">'
-            '<IMG SRC="image/2608/IMG_5201_sgarbossa1024.jpeg">'
-            '</a>'
-        )
+class ScienceApiImageTest(unittest.TestCase):
+    def test_prefers_featured_image_file_over_featured_image_url(self):
+        response = json.dumps([{
+            "title": {"rendered": "Lion's Head"},
+            "featured_image_url": "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/august/lions_head_nebula.jpg?w=1280",
+            "featured_image": {"file": "https://assets.science.nasa.gov/dynamicimage/assets/science/missions/webb/science/2026/08/STScI.png"},
+        }]).encode("utf-8")
+        with mock.patch.object(apod.urllib.request, "urlopen", return_value=io.BytesIO(response)):
+            result = apod.fetch_apod_from_science_api("2026-08-26")
 
         self.assertEqual(
-            "image/2608/IMG_5201.jpeg",
-            parser.full_image_path,
+            "https://assets.science.nasa.gov/content/dam/science/missions/webb/science/2026/08/STScI.png",
+            result["hdurl"],
         )
+
+    def test_api_image_replaces_the_feed_image(self):
+        feed = {"title": "Cosmic Latte", "date": "2026-09-28", "hdurl": "https://assets.science.nasa.gov/content/dam/a/CosmicLatte_jhu_960.jpg", "media_type": "image"}
+        api = {"hdurl": "https://assets.science.nasa.gov/content/dam/a/CosmicLatte_jhu_960_annotated.jpg", "media_type": "image"}
+        with mock.patch.object(apod, "fetch_apod_from_feed", return_value=dict(feed)), \
+                mock.patch.object(apod, "fetch_apod_from_science_api", return_value=api):
+            result = apod.fetch_apod_from_science_nasa("2026-09-28")
+
+        self.assertEqual("Cosmic Latte", result["title"])
+        self.assertEqual(api["hdurl"], result["hdurl"])
+
+
+class ScienceApiVideoTest(unittest.TestCase):
+    def test_marks_embedded_video_days_as_video(self):
+        response = json.dumps([{
+            "title": {"rendered": "Launch"},
+            "featured_image": {"file": "https://assets.science.nasa.gov/content/dam/a/poster.jpg"},
+            "content": {"rendered": "<figure><iframe src=\"https://www.youtube.com/embed/x\"></iframe></figure>"},
+        }]).encode("utf-8")
+        with mock.patch.object(apod.urllib.request, "urlopen", return_value=io.BytesIO(response)):
+            result = apod.fetch_apod_from_science_api("2026-08-23")
+
+        self.assertEqual("video", result["media_type"])
 
 
 class CachedImageFilesTest(unittest.TestCase):

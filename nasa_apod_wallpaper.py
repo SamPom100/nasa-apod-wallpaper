@@ -9,12 +9,12 @@ import sys
 import copy
 import json
 import plistlib
+import hashlib
 import random
 import time
 import urllib.request
 import urllib.error
 import urllib.parse
-from html.parser import HTMLParser
 from pathlib import Path
 import re
 import subprocess
@@ -111,39 +111,8 @@ APOD_API_URL = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}"
 SCIENCE_NASA_SITE_URL = "https://science.nasa.gov/apod"
 APOD_SITE_URL = SCIENCE_NASA_SITE_URL
 SCIENCE_NASA_ASSETS_URL = "https://assets.science.nasa.gov/content/dam/science/cds/apod/apod"
-SCIENCE_NASA_DYNAMIC_URL = "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod"
 SCIENCE_NASA_FEED_URL = "https://science.nasa.gov/feed/apod-basic/"
 SCIENCE_NASA_API_URL = "https://science.nasa.gov/wp-json/wp/v2/image-article"
-
-
-class ApodPageParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.current_link = None
-        self.full_image_path = None
-
-    def handle_starttag(self, tag, attrs):
-        attributes = dict(attrs)
-        if tag.lower() == 'a':
-            self.current_link = attributes.get('href')
-        elif tag.lower() == 'img' and self.current_link:
-            source = attributes.get('src')
-            link_extension = Path(
-                urllib.parse.urlparse(self.current_link).path
-            ).suffix.lower()
-            source_extension = Path(
-                urllib.parse.urlparse(source or '').path
-            ).suffix.lower()
-            if (
-                link_extension in IMAGE_EXTENSIONS
-                and source_extension in IMAGE_EXTENSIONS
-                and self.full_image_path is None
-            ):
-                self.full_image_path = self.current_link
-
-    def handle_endtag(self, tag):
-        if tag.lower() == 'a':
-            self.current_link = None
 
 
 def fetch_apod_data(date=None, exit_on_error=True, max_attempts=FETCH_ATTEMPTS):
@@ -213,9 +182,7 @@ def fetch_apod_from_feed(target_date=None):
                 url_elem = item.find('apod:url', ns)
                 raw_url = url_elem.text if url_elem is not None and url_elem.text else page_url
 
-                hdurl = raw_hdurl
-                if hdurl and 'dynamicimage/assets/' in hdurl:
-                    hdurl = re.sub(r'dynamicimage/assets/(.*?)\?.*', r'content/dam/\1', hdurl)
+                hdurl = master_image_url(raw_hdurl) if raw_hdurl else None
 
                 explanation_elem = item.find('apod:explanation', ns)
                 explanation = ''
@@ -265,12 +232,7 @@ def fetch_apod_article_by_url(url):
             img_match = re.search(r'src=[\"\'](https://assets\.science\.nasa\.gov/[^\"\']*(?:\.jpg|\.jpeg|\.png)[^\"\']*)[\"\']', html)
         raw_img = img_match.group(1).replace('&amp;', '&') if img_match else None
 
-        if raw_img:
-            full_res = raw_img.split('?')[0]
-            full_res = re.sub(r'/jcr:content/renditions/.*', '', full_res)
-            full_res = full_res.replace('dynamicimage/assets/', 'content/dam/')
-        else:
-            full_res = None
+        full_res = master_image_url(raw_img) if raw_img else None
 
         exp_match = re.search(r'media-detail-hero__description\">(.*?)</p>', html, re.DOTALL)
         if exp_match:
@@ -293,20 +255,18 @@ def fetch_apod_article_by_url(url):
     return None
 
 
-def fetch_apod_from_science_nasa(target_date=None):
-    """Fetch APOD metadata from science.nasa.gov (article URL, feed, or WP REST API)."""
-    if target_date and str(target_date).startswith(('http://', 'https://')):
-        return fetch_apod_article_by_url(target_date)
+def master_image_url(url):
+    """Return the full-size assets.science.nasa.gov master URL for a CDN image URL."""
+    parsed = urllib.parse.urlparse(url)
+    if 'assets.science.nasa.gov' not in parsed.netloc:
+        return url
+    path = re.sub(r'/jcr:content/renditions/.*', '', parsed.path)
+    path = path.replace('/dynamicimage/assets/', '/content/dam/')
+    return f"https://assets.science.nasa.gov{path}"
 
-    if target_date is None:
-        target_date = datetime.now().strftime('%Y-%m-%d')
 
-    # 1. Try the RSS feed first (fastest and covers the last 30 days)
-    data = fetch_apod_from_feed(target_date)
-    if data is not None:
-        return data
-
-    # 2. Try the science.nasa.gov WordPress REST API
+def fetch_apod_from_science_api(target_date):
+    """Fetch APOD metadata for a date from the science.nasa.gov WordPress REST API."""
     try:
         print(f"Searching science.nasa.gov API for {target_date}...", flush=True)
         api_url = (
@@ -316,43 +276,59 @@ def fetch_apod_from_science_nasa(target_date=None):
         req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=15) as resp:
             posts = json.load(resp)
-        if posts and isinstance(posts, list):
-            item = posts[0]
-            title = item.get('title', {}).get('rendered', 'NASA APOD')
-            title = title.replace('&#8211;', '-').replace('&#8217;', "'").replace('&amp;', '&')
-            if title.startswith('APOD:'):
-                title = re.sub(r'^APOD:\s*\d{4}\s+[A-Za-z]+\s+\d{1,2}\s*[\u2013-]\s*', '', title)
-            article_link = item.get('link', '')
-            img_url = item.get('featured_image_url')
-            if not img_url and item.get('featured_image'):
-                img_url = item['featured_image'].get('file')
-            if img_url:
-                full_res = img_url.split('?')[0]
-                full_res = re.sub(r'/jcr:content/renditions/.*', '', full_res)
-                full_res = full_res.replace('dynamicimage/assets/', 'content/dam/')
-            else:
-                full_res = None
+        if not posts or not isinstance(posts, list):
+            return None
+        item = posts[0]
+        title = item.get('title', {}).get('rendered', 'NASA APOD')
+        title = title.replace('&#8211;', '-').replace('&#8217;', "'").replace('&amp;', '&')
+        if title.startswith('APOD:'):
+            title = re.sub(r'^APOD:\s*\d{4}\s+[A-Za-z]+\s+\d{1,2}\s*[\u2013-]\s*', '', title)
+        article_link = item.get('link', '')
+        img_url = (item.get('featured_image') or {}).get('file') or item.get('featured_image_url')
+        full_res = master_image_url(img_url) if img_url else None
 
-            explanation = ''
-            content_html = item.get('content', {}).get('rendered', '')
-            exp_match = re.search(r'media-detail-hero__description\">(.*?)</p>', content_html, re.DOTALL)
-            if exp_match:
-                explanation = re.sub(r'<[^>]+>', '', exp_match.group(1)).strip()
-                if explanation.lower().startswith('explanation:'):
-                    explanation = explanation[12:].strip()
+        explanation = ''
+        content_html = item.get('content', {}).get('rendered', '')
+        exp_match = re.search(r'media-detail-hero__description\">(.*?)</p>', content_html, re.DOTALL)
+        if exp_match:
+            explanation = re.sub(r'<[^>]+>', '', exp_match.group(1)).strip()
+            if explanation.lower().startswith('explanation:'):
+                explanation = explanation[12:].strip()
 
-            return {
-                'title': title,
-                'date': target_date,
-                'explanation': explanation,
-                'hdurl': full_res,
-                'url': article_link or full_res,
-                'media_type': 'image' if full_res else 'other',
-            }
+        if re.search(r'<(video|iframe)\b', content_html, re.IGNORECASE):
+            media_type = 'video'
+        else:
+            media_type = 'image' if full_res else 'other'
+
+        return {
+            'title': title,
+            'date': target_date,
+            'explanation': explanation,
+            'hdurl': full_res,
+            'url': article_link or full_res,
+            'media_type': media_type,
+        }
     except Exception as e:
         print(f"Error querying science.nasa.gov API: {e}", flush=True)
-
     return None
+
+
+def fetch_apod_from_science_nasa(target_date=None):
+    """Fetch APOD metadata from science.nasa.gov, with the image path from the WP REST API."""
+    if target_date and str(target_date).startswith(('http://', 'https://')):
+        return fetch_apod_article_by_url(target_date)
+
+    if target_date is None:
+        target_date = datetime.now().strftime('%Y-%m-%d')
+
+    data = fetch_apod_from_feed(target_date)
+    api_data = fetch_apod_from_science_api(target_date)
+    if data is None:
+        return api_data
+    if api_data and api_data.get('hdurl'):
+        data['hdurl'] = api_data['hdurl']
+        data['media_type'] = api_data['media_type']
+    return data
 
 
 def fetch_apod_with_fallback(date=None, exit_on_error=True):
@@ -411,6 +387,9 @@ def download_image(url, filename, exit_on_error=True):
             temporary_path.write_bytes(response.read())
         if not is_valid_image(temporary_path):
             raise ValueError("The download is not a valid image")
+        duplicate = find_duplicate_image(temporary_path, filepath)
+        if duplicate is not None:
+            raise ValueError(f"The download matches another cached image: {duplicate.name}")
         temporary_path.replace(filepath)
 
         print(f"Image saved to: {filepath}")
@@ -424,6 +403,24 @@ def download_image(url, filename, exit_on_error=True):
         return None
 
 
+def file_sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def find_duplicate_image(path, target_path):
+    """Return a cached APOD image for another date with the same content, or None."""
+    digest = file_sha256(path)
+    for cached in WALLPAPER_DIR.glob("apod_*"):
+        if (
+            cached.is_file()
+            and cached.stem != target_path.stem
+            and cached.suffix.lower() in IMAGE_EXTENSIONS
+            and file_sha256(cached) == digest
+        ):
+            return cached
+    return None
+
+
 def image_extension(url):
     """Return a supported image extension from a URL."""
     extension = Path(urllib.parse.urlparse(url).path).suffix.lower()
@@ -431,80 +428,61 @@ def image_extension(url):
 
 
 def fetch_apod_page_image_url(date_str):
-    """Fetch the highest-resolution image URL from the science.nasa.gov APOD webpage."""
+    """Fetch the full-size image URL for a date from science.nasa.gov."""
     data = fetch_apod_from_science_nasa(date_str)
     if data and data.get('hdurl'):
         return data['hdurl']
-
-    # Legacy fallback for archive testing
-    try:
-        date = datetime.strptime(date_str, '%Y-%m-%d')
-        page_url = f"https://apod.nasa.gov/apod/ap{date:%y%m%d}.html"
-        with urllib.request.urlopen(page_url, timeout=10) as response:
-            page = response.read().decode('utf-8', errors='replace')
-
-        parser = ApodPageParser()
-        parser.feed(page)
-        if parser.full_image_path:
-            return urllib.parse.urljoin(page_url, parser.full_image_path)
-    except Exception:
-        pass
     return None
 
 
 def to_science_nasa_urls(url, date_str):
-    """Convert an image URL to assets.science.nasa.gov CDN URLs."""
+    """Convert an image URL to its assets.science.nasa.gov master URL."""
     try:
         parsed = urllib.parse.urlparse(url)
         if 'assets.science.nasa.gov' in parsed.netloc:
-            clean_path = parsed.path
-            clean_path = re.sub(r'/jcr:content/renditions/.*', '', clean_path)
-            if 'dynamicimage/assets/' in clean_path:
-                clean_path = clean_path.replace('dynamicimage/assets/', 'content/dam/')
-            master_url = f"https://assets.science.nasa.gov{clean_path}"
-            dynamic_path = clean_path.replace('content/dam/', 'dynamicimage/assets/')
-            dynamic_url = f"https://assets.science.nasa.gov{dynamic_path}?w=4096&fit=clip"
-            return [master_url, dynamic_url]
-        elif 'apod.nasa.gov' in parsed.netloc or not parsed.netloc:
+            return [master_image_url(url)]
+        if 'apod.nasa.gov' in parsed.netloc or not parsed.netloc:
             filename = Path(parsed.path).name
             if filename:
                 date = datetime.strptime(date_str, '%Y-%m-%d')
                 month = date.strftime('%B').lower()
-                return [
-                    f"{SCIENCE_NASA_ASSETS_URL}/{date.year}/{month}/{filename}",
-                    f"{SCIENCE_NASA_DYNAMIC_URL}/{date.year}/{month}/{filename}?w=4096&fit=clip",
-                ]
+                return [f"{SCIENCE_NASA_ASSETS_URL}/{date.year}/{month}/{filename}"]
     except Exception:
         pass
     return []
 
 
-def download_apod_image(apod_data, date_str, exit_on_error=True):
-    """Download the API full-resolution image or its APOD webpage fallback."""
-    api_url = apod_data.get('hdurl')
-    if api_url:
-        filename = f"apod_{date_str}{image_extension(api_url)}"
-        for science_url in to_science_nasa_urls(api_url, date_str):
-            image_path = download_image(science_url, filename, exit_on_error=False)
-            if image_path is not None:
-                return image_path
-        image_path = download_image(api_url, filename, exit_on_error=False)
-        if image_path is not None:
-            return image_path
-        print("The API full-resolution image failed.")
-    else:
-        print("The API has no full-resolution image URL.")
+def image_download_urls(url, date_str):
+    """Return the URLs to try for an image, never the retired apod.nasa.gov host."""
+    urls = to_science_nasa_urls(url, date_str)
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc and 'apod.nasa.gov' not in parsed.netloc and url not in urls:
+        urls.append(url)
+    return urls
 
-    page_url = fetch_apod_page_image_url(date_str)
-    if page_url:
-        filename = f"apod_{date_str}{image_extension(page_url)}"
-        for science_url in to_science_nasa_urls(page_url, date_str):
-            image_path = download_image(science_url, filename, exit_on_error=False)
+
+def download_apod_image(apod_data, date_str, exit_on_error=True):
+    """Download the full-size APOD image, falling back to the science.nasa.gov API image."""
+    tried = set()
+
+    def download_from(source_url):
+        filename = f"apod_{date_str}{image_extension(source_url)}"
+        for url in image_download_urls(source_url, date_str):
+            if url in tried:
+                continue
+            tried.add(url)
+            image_path = download_image(url, filename, exit_on_error=False)
             if image_path is not None:
                 return image_path
-        image_path = download_image(page_url, filename, exit_on_error=False)
-        if image_path is not None:
-            return image_path
+        return None
+
+    api_url = apod_data.get('hdurl')
+    image_path = download_from(api_url) if api_url else None
+    if image_path is None:
+        page_url = fetch_apod_page_image_url(date_str)
+        image_path = download_from(page_url) if page_url else None
+    if image_path is not None:
+        return image_path
 
     print("Error: Could not download a full-resolution APOD image")
     if exit_on_error:
@@ -903,39 +881,22 @@ def backfill(days):
             skipped_existing += 1
             continue
 
-        # Try API first without retrying repeatedly if rate-limited
-        data = fetch_apod_data(date_str, exit_on_error=False, max_attempts=1)
+        data = fetch_apod_from_science_nasa(date_str)
         if data is None:
-            data = fetch_apod_from_feed(date_str)
-        if data is not None:
-            if data.get('media_type') != 'image':
-                print(f"  {date_str}: skipping ({data.get('media_type')})", flush=True)
-                skipped_video += 1
-                continue
-
-            result = download_apod_image(data, date_str, exit_on_error=False)
-            if result is not None:
-                downloaded += 1
-                continue
-
-        # Fallback to APOD website directly if API is unavailable, rate-limited, or failed
-        page_url = fetch_apod_page_image_url(date_str)
-        if page_url:
-            filename = f"apod_{date_str}{image_extension(page_url)}"
-            result = None
-            for science_url in to_science_nasa_urls(page_url, date_str):
-                result = download_image(science_url, filename, exit_on_error=False)
-                if result is not None:
-                    break
-            if result is None:
-                result = download_image(page_url, filename, exit_on_error=False)
-            if result is not None:
-                downloaded += 1
-            else:
-                failed += 1
-        else:
-            print(f"  {date_str}: skipping (non-image or unavailable)", flush=True)
+            data = fetch_apod_data(date_str, exit_on_error=False, max_attempts=1)
+        if data is None:
+            print(f"  {date_str}: unavailable", flush=True)
+            failed += 1
+            continue
+        if data.get('media_type') != 'image':
+            print(f"  {date_str}: skipping ({data.get('media_type')})", flush=True)
             skipped_video += 1
+            continue
+
+        if download_apod_image(data, date_str, exit_on_error=False) is not None:
+            downloaded += 1
+        else:
+            failed += 1
 
     print("\n" + "=" * 60, flush=True)
     print(f"Backfill complete: {downloaded} downloaded, "
