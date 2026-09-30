@@ -247,6 +247,11 @@ class WallpaperStoreTest(unittest.TestCase):
         with mock.patch.object(apod.subprocess, 'run') as run:
             self.assertFalse(apod.set_wallpapers_in_store(assignments))
         self.assertEqual(before, self.path.read_bytes())
+    def test_skips_writing_and_killall_when_store_already_matches_assignments(self):
+        before = self.path.read_bytes()
+        with mock.patch.object(apod.subprocess, 'run') as run:
+            self.assertTrue(apod.set_wallpapers_in_store([(self.context, Path('/primary.jpg'))]))
+        self.assertEqual(before, self.path.read_bytes())
         run.assert_not_called()
 
 

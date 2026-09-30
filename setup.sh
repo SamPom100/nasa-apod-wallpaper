@@ -107,6 +107,12 @@ if [[ ! $REPLY =~ ^[Nn]$ ]]; then
     <array>
         <dict>
             <key>Hour</key>
+            <integer>0</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
             <integer>9</integer>
             <key>Minute</key>
             <integer>3</integer>

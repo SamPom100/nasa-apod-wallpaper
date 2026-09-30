@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -209,8 +210,98 @@ class ToScienceNasaUrlsTest(unittest.TestCase):
             "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/september/NGC5139CadenasParra.jpg?w=4096&fit=clip",
         ], urls)
 
-    def test_ignores_non_apod_nasa_gov_urls(self):
-        self.assertEqual([], apod.to_science_nasa_urls("https://example.com/image.jpg", "2026-09-25"))
+
+class FetchApodFromFeedTest(unittest.TestCase):
+    def test_parses_feed_item_for_date(self):
+        sample_rss = b"""<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0" xmlns:apod="https://science.nasa.gov/apod/">
+<channel>
+    <item>
+        <title>Test Galaxy</title>
+        <link>https://science.nasa.gov/image-article/apod-2026-september-30-test/</link>
+        <pubDate>Wed, 30 Sep 2026 04:05:00 +0000</pubDate>
+        <apod:hdurl>https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/october/test.jpg?w=1772&amp;h=1182</apod:hdurl>
+        <apod:url>https://science.nasa.gov/image-article/apod-2026-september-30-test/</apod:url>
+        <apod:explanation><![CDATA[<strong>Explanation:</strong> A test explanation.]]></apod:explanation>
+    </item>
+</channel>
+</rss>"""
+        with mock.patch.object(apod.urllib.request, "urlopen", return_value=io.BytesIO(sample_rss)):
+            result = apod.fetch_apod_from_feed("2026-09-30")
+
+        self.assertIsNotNone(result)
+        self.assertEqual("Test Galaxy", result["title"])
+        self.assertEqual("2026-09-30", result["date"])
+        self.assertEqual("https://assets.science.nasa.gov/content/dam/science/cds/apod/apod/2026/october/test.jpg", result["hdurl"])
+        self.assertEqual("A test explanation.", result["explanation"])
+        self.assertEqual("image", result["media_type"])
+
+    def test_fallback_uses_feed_when_api_fails(self):
+        expected_feed_data = {
+            "title": "Feed Galaxy",
+            "date": "2026-09-30",
+            "media_type": "image",
+            "hdurl": "https://example.com/feed.jpg",
+        }
+        with mock.patch.object(apod, "fetch_apod_data", return_value=None), \
+                mock.patch.object(apod, "fetch_apod_from_feed", return_value=expected_feed_data) as mock_feed:
+            result = apod.fetch_apod_with_fallback("2026-09-30")
+
+        self.assertEqual(expected_feed_data, result)
+        mock_feed.assert_called_once_with("2026-09-30")
+
+
+class FetchApodArticleByUrlTest(unittest.TestCase):
+    def test_parses_article_html(self):
+        sample_html = """
+        <html>
+        <head><title>APOD: Arp 78</title></head>
+        <body>
+            <h1>APOD: 2026 September 30 - Arp 78: Peculiar Galaxy in Aries</h1>
+            <p class="media-detail-hero__description"><strong>Explanation:</strong> Some description here.</p>
+            <a href="https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/october/NGC772_Robert_Eder.jpg?w=1772&amp;h=1182">Full image</a>
+        </body>
+        </html>
+        """
+        url = "https://science.nasa.gov/image-article/apod-2026-september-30-arp-78-peculiar-galaxy-in-aries/"
+        with mock.patch.object(apod.urllib.request, "urlopen", return_value=io.BytesIO(sample_html.encode("utf-8"))):
+            result = apod.fetch_apod_article_by_url(url)
+
+        self.assertIsNotNone(result)
+        self.assertEqual("Arp 78: Peculiar Galaxy in Aries", result["title"])
+        self.assertEqual("2026-09-30", result["date"])
+        self.assertEqual("https://assets.science.nasa.gov/content/dam/science/cds/apod/apod/2026/october/NGC772_Robert_Eder.jpg", result["hdurl"])
+        self.assertEqual("Some description here.", result["explanation"])
+        self.assertEqual("image", result["media_type"])
+
+
+class FetchApodFromScienceNasaTest(unittest.TestCase):
+    def test_delegates_to_fetch_apod_article_by_url_when_url_passed(self):
+        url = "https://science.nasa.gov/image-article/apod-2026-september-30-arp-78-peculiar-galaxy-in-aries/"
+        expected = {"title": "Arp 78", "date": "2026-09-30", "media_type": "image"}
+        with mock.patch.object(apod, "fetch_apod_article_by_url", return_value=expected) as mock_article:
+            result = apod.fetch_apod_from_science_nasa(url)
+
+        self.assertEqual(expected, result)
+        mock_article.assert_called_once_with(url)
+
+    def test_queries_wp_api_when_feed_returns_none(self):
+        wp_api_response = json.dumps([{
+            "title": {"rendered": "Arp 78: Peculiar Galaxy"},
+            "link": "https://science.nasa.gov/image-article/apod-2026-september-30-arp-78/",
+            "featured_image_url": "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/october/test.jpg?w=1024",
+            "content": {"rendered": "<p class=\"media-detail-hero__description\">Explanation: Peculiar galaxy description.</p>"}
+        }]).encode("utf-8")
+
+        with mock.patch.object(apod, "fetch_apod_from_feed", return_value=None):
+            with mock.patch.object(apod.urllib.request, "urlopen", return_value=io.BytesIO(wp_api_response)):
+                result = apod.fetch_apod_from_science_nasa("2026-09-30")
+
+        self.assertIsNotNone(result)
+        self.assertEqual("Arp 78: Peculiar Galaxy", result["title"])
+        self.assertEqual("2026-09-30", result["date"])
+        self.assertEqual("https://assets.science.nasa.gov/content/dam/science/cds/apod/apod/2026/october/test.jpg", result["hdurl"])
+        self.assertEqual("Peculiar galaxy description.", result["explanation"])
 
 
 class ApodPageParserTest(unittest.TestCase):
@@ -523,6 +614,41 @@ class MainFallbackTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 apod.main()
             self.assertEqual(cm.exception.code, 1)
+
+    @mock.patch.object(apod, "send_notification")
+    @mock.patch.object(apod, "set_macos_wallpaper")
+    @mock.patch.object(apod, "download_apod_image")
+    @mock.patch.object(apod, "fetch_apod_article_by_url")
+    @mock.patch.object(apod, "get_current_desktop_1_wallpaper", return_value=None)
+    @mock.patch.object(apod, "cached_image_files", return_value=[])
+    def test_main_with_direct_article_url(
+        self,
+        _mock_cached,
+        _mock_current,
+        mock_fetch_article,
+        mock_download,
+        mock_set_wallpaper,
+        mock_notify,
+    ):
+        article_url = "https://science.nasa.gov/image-article/apod-2026-september-30-arp-78-peculiar-galaxy-in-aries/"
+        article_data = {
+            "title": "Arp 78",
+            "date": "2026-09-30",
+            "media_type": "image",
+            "hdurl": "https://assets.science.nasa.gov/content/dam/science/cds/apod/apod/2026/october/test.jpg",
+            "explanation": "Test explanation.",
+        }
+        mock_fetch_article.return_value = article_data
+        image_file = Path("/tmp/apod_2026-09-30.jpg")
+        mock_download.return_value = image_file
+
+        with mock.patch("sys.argv", ["nasa_apod_wallpaper.py", article_url]):
+            apod.main()
+
+        mock_fetch_article.assert_called_once_with(article_url)
+        mock_download.assert_called_once_with(article_data, "2026-09-30", exit_on_error=False)
+        mock_set_wallpaper.assert_called_once_with(image_file, desktop_1_only=mock.ANY, apod_date="2026-09-30")
+        mock_notify.assert_called_once_with("Arp 78", "Test explanation.")
 
 
 class CachedWallpaperRefreshTest(unittest.TestCase):

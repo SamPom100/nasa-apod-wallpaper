@@ -16,8 +16,10 @@ import urllib.error
 import urllib.parse
 from html.parser import HTMLParser
 from pathlib import Path
+import re
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 # Directory to store downloaded wallpapers and config
@@ -106,10 +108,12 @@ def load_api_key(config=None):
 CONFIG = load_config()
 NASA_API_KEY = load_api_key(CONFIG)
 APOD_API_URL = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}"
-APOD_SITE_URL = "https://apod.nasa.gov/apod"
 SCIENCE_NASA_SITE_URL = "https://science.nasa.gov/apod"
+APOD_SITE_URL = SCIENCE_NASA_SITE_URL
 SCIENCE_NASA_ASSETS_URL = "https://assets.science.nasa.gov/content/dam/science/cds/apod/apod"
 SCIENCE_NASA_DYNAMIC_URL = "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod"
+SCIENCE_NASA_FEED_URL = "https://science.nasa.gov/feed/apod-basic/"
+SCIENCE_NASA_API_URL = "https://science.nasa.gov/wp-json/wp/v2/image-article"
 
 
 class ApodPageParser(HTMLParser):
@@ -177,19 +181,223 @@ def fetch_apod_data(date=None, exit_on_error=True, max_attempts=FETCH_ATTEMPTS):
         return None
 
 
+def fetch_apod_from_feed(target_date=None):
+    """Fetch APOD metadata from NASA Science RSS feed. Returns data dict, or None on failure."""
+    if target_date is None:
+        target_date = datetime.now().strftime('%Y-%m-%d')
+    print(f"Fetching NASA APOD from NASA Science feed for {target_date}...", flush=True)
+    req = urllib.request.Request(SCIENCE_NASA_FEED_URL, headers={'User-Agent': 'Mozilla/5.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            tree = ET.parse(resp)
+        ns = {'apod': 'https://science.nasa.gov/apod/'}
+        channel = tree.getroot().find('channel')
+        if channel is None:
+            return None
+        for item in channel.findall('item'):
+            pub_date_elem = item.find('pubDate')
+            if pub_date_elem is None or not pub_date_elem.text:
+                continue
+            try:
+                pub_dt = datetime.strptime(pub_date_elem.text[:16].strip(), '%a, %d %b %Y')
+                item_date = pub_dt.strftime('%Y-%m-%d')
+            except ValueError:
+                continue
+            if item_date == target_date:
+                title_elem = item.find('title')
+                title = title_elem.text if title_elem is not None else 'NASA APOD'
+                link_elem = item.find('link')
+                page_url = link_elem.text if link_elem is not None else ''
+                hdurl_elem = item.find('apod:hdurl', ns)
+                raw_hdurl = hdurl_elem.text.replace('&amp;', '&') if hdurl_elem is not None and hdurl_elem.text else None
+                url_elem = item.find('apod:url', ns)
+                raw_url = url_elem.text if url_elem is not None and url_elem.text else page_url
+
+                hdurl = raw_hdurl
+                if hdurl and 'dynamicimage/assets/' in hdurl:
+                    hdurl = re.sub(r'dynamicimage/assets/(.*?)\?.*', r'content/dam/\1', hdurl)
+
+                explanation_elem = item.find('apod:explanation', ns)
+                explanation = ''
+                if explanation_elem is not None and explanation_elem.text:
+                    explanation = re.sub(r'<[^>]+>', '', explanation_elem.text).strip()
+                    if explanation.lower().startswith('explanation:'):
+                        explanation = explanation[12:].strip()
+
+                return {
+                    'title': title,
+                    'date': item_date,
+                    'explanation': explanation,
+                    'hdurl': hdurl or raw_url,
+                    'url': raw_url or hdurl,
+                    'media_type': 'image' if (hdurl or raw_url) else 'other',
+                }
+    except Exception as e:
+        print(f"Error fetching APOD from NASA Science feed: {e}", flush=True)
+    return None
+
+
+def fetch_apod_article_by_url(url):
+    """Fetch APOD metadata directly from a science.nasa.gov image-article URL."""
+    try:
+        print(f"Fetching APOD article from {url}...", flush=True)
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode('utf-8', errors='ignore')
+
+        title_match = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL)
+        title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip() if title_match else 'NASA APOD'
+        if title.startswith('APOD:'):
+            title = re.sub(r'^APOD:\s*\d{4}\s+[A-Za-z]+\s+\d{1,2}\s*[\u2013-]\s*', '', title)
+
+        date_match = re.search(r'apod-(\d{4})-([a-z]+)-(\d{1,2})', url)
+        if date_match:
+            year, month_name, day = date_match.groups()
+            dt = datetime.strptime(f'{year}-{month_name}-{day}', '%Y-%B-%d')
+            date_str = dt.strftime('%Y-%m-%d')
+        else:
+            date_str = datetime.now().strftime('%Y-%m-%d')
+
+        img_match = re.search(r'href=[\"\'](https://assets\.science\.nasa\.gov/[^\"\']*(?:\.jpg|\.jpeg|\.png)[^\"\']*)[\"\']', html)
+        if not img_match:
+            img_match = re.search(r'content=[\"\'](https://assets\.science\.nasa\.gov/[^\"\']*(?:\.jpg|\.jpeg|\.png)[^\"\']*)[\"\']', html)
+        if not img_match:
+            img_match = re.search(r'src=[\"\'](https://assets\.science\.nasa\.gov/[^\"\']*(?:\.jpg|\.jpeg|\.png)[^\"\']*)[\"\']', html)
+        raw_img = img_match.group(1).replace('&amp;', '&') if img_match else None
+
+        if raw_img:
+            full_res = raw_img.split('?')[0]
+            full_res = re.sub(r'/jcr:content/renditions/.*', '', full_res)
+            full_res = full_res.replace('dynamicimage/assets/', 'content/dam/')
+        else:
+            full_res = None
+
+        exp_match = re.search(r'media-detail-hero__description\">(.*?)</p>', html, re.DOTALL)
+        if exp_match:
+            explanation = re.sub(r'<[^>]+>', '', exp_match.group(1)).strip()
+            if explanation.lower().startswith('explanation:'):
+                explanation = explanation[12:].strip()
+        else:
+            explanation = ''
+
+        return {
+            'title': title,
+            'date': date_str,
+            'explanation': explanation,
+            'hdurl': full_res,
+            'url': url,
+            'media_type': 'image' if full_res else 'other',
+        }
+    except Exception as e:
+        print(f"Error fetching APOD article: {e}", flush=True)
+    return None
+
+
+def fetch_apod_from_science_nasa(target_date=None):
+    """Fetch APOD metadata from science.nasa.gov (article URL, feed, or WP REST API)."""
+    if target_date and str(target_date).startswith(('http://', 'https://')):
+        return fetch_apod_article_by_url(target_date)
+
+    if target_date is None:
+        target_date = datetime.now().strftime('%Y-%m-%d')
+
+    # 1. Try the RSS feed first (fastest and covers the last 30 days)
+    data = fetch_apod_from_feed(target_date)
+    if data is not None:
+        return data
+
+    # 2. Try the science.nasa.gov WordPress REST API
+    try:
+        print(f"Searching science.nasa.gov API for {target_date}...", flush=True)
+        api_url = (
+            f"{SCIENCE_NASA_API_URL}?"
+            f"categories=22766&after={target_date}T00:00:00&before={target_date}T23:59:59"
+        )
+        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            posts = json.load(resp)
+        if posts and isinstance(posts, list):
+            item = posts[0]
+            title = item.get('title', {}).get('rendered', 'NASA APOD')
+            title = title.replace('&#8211;', '-').replace('&#8217;', "'").replace('&amp;', '&')
+            if title.startswith('APOD:'):
+                title = re.sub(r'^APOD:\s*\d{4}\s+[A-Za-z]+\s+\d{1,2}\s*[\u2013-]\s*', '', title)
+            article_link = item.get('link', '')
+            img_url = item.get('featured_image_url')
+            if not img_url and item.get('featured_image'):
+                img_url = item['featured_image'].get('file')
+            if img_url:
+                full_res = img_url.split('?')[0]
+                full_res = re.sub(r'/jcr:content/renditions/.*', '', full_res)
+                full_res = full_res.replace('dynamicimage/assets/', 'content/dam/')
+            else:
+                full_res = None
+
+            explanation = ''
+            content_html = item.get('content', {}).get('rendered', '')
+            exp_match = re.search(r'media-detail-hero__description\">(.*?)</p>', content_html, re.DOTALL)
+            if exp_match:
+                explanation = re.sub(r'<[^>]+>', '', exp_match.group(1)).strip()
+                if explanation.lower().startswith('explanation:'):
+                    explanation = explanation[12:].strip()
+
+            return {
+                'title': title,
+                'date': target_date,
+                'explanation': explanation,
+                'hdurl': full_res,
+                'url': article_link or full_res,
+                'media_type': 'image' if full_res else 'other',
+            }
+    except Exception as e:
+        print(f"Error querying science.nasa.gov API: {e}", flush=True)
+
+    return None
+
+
 def fetch_apod_with_fallback(date=None, exit_on_error=True):
-    """Fetch APOD data with fallback to yesterday if today isn't available"""
+    """Fetch APOD data primarily from science.nasa.gov, with fallback to yesterday if needed."""
+    if date and str(date).startswith(('http://', 'https://')):
+        data = fetch_apod_from_science_nasa(date)
+        if data is not None:
+            return data
+        if exit_on_error:
+            sys.exit(1)
+        return None
+
     if date:
-        return fetch_apod_data(date, exit_on_error=exit_on_error)
+        data = fetch_apod_from_science_nasa(date)
+        if data is not None:
+            return data
+        data = fetch_apod_data(date, exit_on_error=False, max_attempts=1)
+        if data is not None:
+            return data
+        if exit_on_error:
+            sys.exit(1)
+        return None
 
     today = datetime.now().strftime('%Y-%m-%d')
-    data = fetch_apod_data(today, exit_on_error=False)
+    data = fetch_apod_from_science_nasa(today)
+    if data is not None:
+        return data
+
+    data = fetch_apod_data(today, exit_on_error=False, max_attempts=1)
     if data is not None:
         return data
 
     yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     print(f"Could not fetch today's APOD, fetching yesterday ({yesterday})...")
-    return fetch_apod_data(yesterday, exit_on_error=exit_on_error)
+    data = fetch_apod_from_science_nasa(yesterday)
+    if data is not None:
+        return data
+
+    data = fetch_apod_data(yesterday, exit_on_error=False, max_attempts=1)
+    if data is not None:
+        return data
+
+    if exit_on_error:
+        sys.exit(1)
+    return None
 
 
 def download_image(url, filename, exit_on_error=True):
@@ -223,11 +431,15 @@ def image_extension(url):
 
 
 def fetch_apod_page_image_url(date_str):
-    """Fetch the highest-resolution image URL from the APOD webpage."""
+    """Fetch the highest-resolution image URL from the science.nasa.gov APOD webpage."""
+    data = fetch_apod_from_science_nasa(date_str)
+    if data and data.get('hdurl'):
+        return data['hdurl']
+
+    # Legacy fallback for archive testing
     try:
         date = datetime.strptime(date_str, '%Y-%m-%d')
-        page_url = f"{APOD_SITE_URL}/ap{date:%y%m%d}.html"
-        print("Fetching the APOD webpage for its full-resolution image...")
+        page_url = f"https://apod.nasa.gov/apod/ap{date:%y%m%d}.html"
         with urllib.request.urlopen(page_url, timeout=10) as response:
             page = response.read().decode('utf-8', errors='replace')
 
@@ -235,17 +447,25 @@ def fetch_apod_page_image_url(date_str):
         parser.feed(page)
         if parser.full_image_path:
             return urllib.parse.urljoin(page_url, parser.full_image_path)
-        print("Error: The APOD webpage has no full-resolution image link")
-    except Exception as e:
-        print(f"Error fetching the APOD webpage: {e}")
+    except Exception:
+        pass
     return None
 
 
 def to_science_nasa_urls(url, date_str):
-    """Convert an apod.nasa.gov image URL to assets.science.nasa.gov CDN URLs."""
+    """Convert an image URL to assets.science.nasa.gov CDN URLs."""
     try:
         parsed = urllib.parse.urlparse(url)
-        if 'apod.nasa.gov' in parsed.netloc or not parsed.netloc:
+        if 'assets.science.nasa.gov' in parsed.netloc:
+            clean_path = parsed.path
+            clean_path = re.sub(r'/jcr:content/renditions/.*', '', clean_path)
+            if 'dynamicimage/assets/' in clean_path:
+                clean_path = clean_path.replace('dynamicimage/assets/', 'content/dam/')
+            master_url = f"https://assets.science.nasa.gov{clean_path}"
+            dynamic_path = clean_path.replace('content/dam/', 'dynamicimage/assets/')
+            dynamic_url = f"https://assets.science.nasa.gov{dynamic_path}?w=4096&fit=clip"
+            return [master_url, dynamic_url]
+        elif 'apod.nasa.gov' in parsed.netloc or not parsed.netloc:
             filename = Path(parsed.path).name
             if filename:
                 date = datetime.strptime(date_str, '%Y-%m-%d')
@@ -431,6 +651,28 @@ DEFAULT_WALLPAPER_CONFIGURATION = {
 }
 
 
+def choice_matches_image(choice, url):
+    """Check if an existing wallpaper store Choice matches the specified image URL."""
+    if not isinstance(choice, dict):
+        return False
+    if choice.get('Provider') != 'com.apple.wallpaper.choice.image':
+        return False
+    cfg_raw = choice.get('Configuration')
+    if cfg_raw:
+        try:
+            cfg = plistlib.loads(cfg_raw)
+            if isinstance(cfg, dict) and cfg.get('type') == 'imageFile':
+                if cfg.get('url', {}).get('relative') == url:
+                    return True
+        except Exception:
+            pass
+    files = choice.get('Files', [])
+    if files and isinstance(files, list) and isinstance(files[0], dict):
+        if files[0].get('relative') == url:
+            return True
+    return False
+
+
 def set_wallpapers_in_store(assignments):
     if not assignments or not WALLPAPER_STORE_INDEX.exists():
         return False
@@ -438,6 +680,7 @@ def set_wallpapers_in_store(assignments):
     try:
         with open(WALLPAPER_STORE_INDEX, "rb") as f:
             data = plistlib.load(f)
+        has_changes = False
         for context, image_path in assignments:
             space = data['Spaces'][context['space_uuid']]
             display = copy.deepcopy(space.get('Displays', {}).get(context['display_uuid'], {}))
@@ -445,8 +688,10 @@ def set_wallpapers_in_store(assignments):
             if not desktop or not desktop.get('Content', {}).get('Choices'):
                 return False
             url = Path(image_path).resolve().as_uri()
-            cfg_dict = copy.deepcopy(DEFAULT_WALLPAPER_CONFIGURATION)
             existing_choices = desktop.get('Content', {}).get('Choices', [])
+            if not existing_choices or not choice_matches_image(existing_choices[0], url):
+                has_changes = True
+            cfg_dict = copy.deepcopy(DEFAULT_WALLPAPER_CONFIGURATION)
             if existing_choices and existing_choices[0].get('Configuration'):
                 try:
                     loaded = plistlib.loads(existing_choices[0]['Configuration'])
@@ -465,6 +710,8 @@ def set_wallpapers_in_store(assignments):
             space.setdefault('Displays', {})[context['display_uuid']] = display
             if 'Displays' in data and context['display_uuid'] in data['Displays']:
                 data['Displays'][context['display_uuid']]['Desktop'] = copy.deepcopy(desktop)
+        if not has_changes:
+            return True
         contents = plistlib.dumps(data, fmt=plistlib.FMT_BINARY)
         with tempfile.NamedTemporaryFile(dir=WALLPAPER_STORE_INDEX.parent, delete=False) as f:
             temporary_path = Path(f.name)
@@ -658,6 +905,8 @@ def backfill(days):
 
         # Try API first without retrying repeatedly if rate-limited
         data = fetch_apod_data(date_str, exit_on_error=False, max_attempts=1)
+        if data is None:
+            data = fetch_apod_from_feed(date_str)
         if data is not None:
             if data.get('media_type') != 'image':
                 print(f"  {date_str}: skipping ({data.get('media_type')})", flush=True)
@@ -854,6 +1103,16 @@ def main():
         print(f"Selected cached wallpaper: {image_path.name}")
     else:
         cleanup_old_images(keep_count=30)
+
+    if desktop_1_only:
+        current_wallpaper = get_current_desktop_1_wallpaper()
+        if current_wallpaper and image_path.resolve() == current_wallpaper.resolve():
+            if reused_fallback:
+                return
+            state.update(date=apod_date, primary=str(Path(image_path).resolve()))
+            save_wallpaper_state(state)
+            print(f"Desktop 1 already has {image_path.name} set.")
+            return
 
     set_macos_wallpaper(image_path, desktop_1_only=desktop_1_only, apod_date=apod_date)
 
