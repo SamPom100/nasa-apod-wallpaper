@@ -437,6 +437,22 @@ class CachedImageFilesTest(unittest.TestCase):
             self.assertEqual(JPEG_IMAGE, valid.read_bytes())
             self.assertTrue(incomplete.exists())
 
+    def test_cleanup_keeps_the_newest_apod_dates_regardless_of_mtime(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            backfilled = directory / 'apod_2000-01-01.jpg'
+            recent = directory / 'apod_2000-01-02.jpg'
+            for path in (backfilled, recent):
+                path.write_bytes(JPEG_IMAGE)
+            os.utime(recent, (1, 1))
+            os.utime(backfilled, (2, 2))
+
+            with mock.patch.object(apod, 'WALLPAPER_DIR', directory):
+                apod.cleanup_old_images(keep_count=1)
+
+            self.assertFalse(backfilled.exists())
+            self.assertTrue(recent.exists())
+
 
 class SetMacOsWallpaperTest(unittest.TestCase):
     def test_primary_only_targets_space_1_while_space_2_is_active(self):

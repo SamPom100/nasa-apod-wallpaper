@@ -34,6 +34,7 @@ FETCH_RETRY_DELAY_SECONDS = 60
 DOWNLOAD_TIMEOUT_SECONDS = 30
 DESKTOP_ATTEMPTS = 3
 DESKTOP_RETRY_DELAY_SECONDS = 5
+CACHE_IMAGE_COUNT = 60
 IMAGE_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.tif', '.tiff'
 }
@@ -834,7 +835,7 @@ def send_notification(title, description):
         print(f"Note: Could not send notification: {e}")
 
 
-def cleanup_old_images(keep_count=30):
+def cleanup_old_images(keep_count=CACHE_IMAGE_COUNT):
     """Remove old APOD images, keeping only the most recent ones"""
     try:
         image_files = [
@@ -845,8 +846,8 @@ def cleanup_old_images(keep_count=30):
         if len(image_files) <= keep_count:
             return  # Nothing to clean up
 
-        # Sort by modification time (newest first)
-        image_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        # Sort by APOD date (newest first)
+        image_files.sort(key=lambda f: f.stem, reverse=True)
 
         # Delete older files beyond keep_count
         files_to_delete = image_files[keep_count:]
@@ -910,7 +911,7 @@ def backfill(days):
           f"{failed} failed", flush=True)
     print("=" * 60, flush=True)
 
-    cleanup_old_images(keep_count=max(30, days))
+    cleanup_old_images(keep_count=max(CACHE_IMAGE_COUNT, days))
 
 
 def get_current_desktop_1_wallpaper():
@@ -1068,7 +1069,7 @@ def main():
         used_cached_fallback = True
         print(f"Selected cached wallpaper: {image_path.name}")
     else:
-        cleanup_old_images(keep_count=30)
+        cleanup_old_images()
 
     if desktop_1_only:
         current_wallpaper = get_current_desktop_1_wallpaper()
