@@ -894,7 +894,7 @@ def backfill(days):
             print(f"  {date_str}: unavailable", flush=True)
             failed += 1
             continue
-        if data.get('media_type') != 'image':
+        if data.get('media_type') != 'image' and not data.get('hdurl'):
             print(f"  {date_str}: skipping ({data.get('media_type')})", flush=True)
             skipped_video += 1
             continue

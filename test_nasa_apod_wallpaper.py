@@ -454,6 +454,24 @@ class CachedImageFilesTest(unittest.TestCase):
             self.assertTrue(recent.exists())
 
 
+class BackfillTest(unittest.TestCase):
+    def test_downloads_the_still_image_of_a_video_post(self):
+        posts = {
+            'video-still': {'media_type': 'video', 'hdurl': 'https://example.com/still.jpg'},
+            'video-only': {'media_type': 'video', 'hdurl': None},
+        }
+        now = apod.datetime(2026, 9, 13)
+        with mock.patch.object(apod, 'cached_image_files', return_value=[]), \
+                mock.patch.object(apod, 'datetime') as fake_datetime, \
+                mock.patch.object(apod, 'fetch_apod_from_science_nasa', side_effect=posts.values()), \
+                mock.patch.object(apod, 'download_apod_image', return_value=Path('/tmp/still.jpg')) as download, \
+                mock.patch.object(apod, 'cleanup_old_images'):
+            fake_datetime.now.return_value = now
+            apod.backfill(2)
+
+        download.assert_called_once_with(posts['video-still'], '2026-09-13', exit_on_error=False)
+
+
 class SetMacOsWallpaperTest(unittest.TestCase):
     def test_primary_only_targets_space_1_while_space_2_is_active(self):
         contexts = [{'display_uuid': 'primary', 'space_uuid': space, 'current_space_uuid': 'space-2'}
