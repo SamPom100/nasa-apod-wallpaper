@@ -383,7 +383,7 @@ def download_image(url, filename, exit_on_error=True):
 
     try:
         print(f"Downloading image from: {url}")
-        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(ascii_url(url), timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
             temporary_path.write_bytes(response.read())
         if not is_valid_image(temporary_path):
             raise ValueError("The download is not a valid image")
@@ -401,6 +401,11 @@ def download_image(url, filename, exit_on_error=True):
         if exit_on_error:
             sys.exit(1)
         return None
+
+
+def ascii_url(url):
+    """Percent-encode the non-ASCII characters in a URL."""
+    return urllib.parse.quote(url, safe=":/?#[]@!$&'()*+,;=%")
 
 
 def file_sha256(path):

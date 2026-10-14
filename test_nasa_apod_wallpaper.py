@@ -139,6 +139,22 @@ class DownloadApodImageTest(unittest.TestCase):
                     self.assertEqual(JPEG_IMAGE, image.read_bytes())
                     self.assertFalse(image.with_suffix('.jpg.download').exists())
 
+    def test_percent_encodes_non_ascii_urls(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            with mock.patch.object(apod, 'WALLPAPER_DIR', directory), \
+                    mock.patch.object(apod.urllib.request, 'urlopen',
+                                      return_value=io.BytesIO(JPEG_IMAGE)) as urlopen:
+                result = apod.download_image(
+                    'https://example.com/2026/october/PZ_Jesli\u010dky_01.png?w=1', 'apod_2026-10-14.png',
+                )
+
+            self.assertEqual(JPEG_IMAGE, result.read_bytes())
+            urlopen.assert_called_once_with(
+                'https://example.com/2026/october/PZ_Jesli%C4%8Dky_01.png?w=1',
+                timeout=apod.DOWNLOAD_TIMEOUT_SECONDS,
+            )
+
     def test_uses_website_when_hd_response_is_not_an_image(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
