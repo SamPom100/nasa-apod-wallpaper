@@ -9,7 +9,7 @@
 - Downloads NASA's Astronomy Picture of the Day every day directly from [science.nasa.gov/apod](https://science.nasa.gov/apod/).
 - Sets it as your Mac desktop wallpaper (supports Desktop 1 only or all spaces).
 - Safely preserves any folder shuffle configured on secondary spaces without advancing them on wake.
-- Uses saved pictures if today's post is a video or offline.
+- Uses saved pictures if today's post is a video, too small for the display, or offline.
 
 ## Usage
 

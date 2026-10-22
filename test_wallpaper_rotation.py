@@ -38,7 +38,8 @@ class WallpaperRotationTest(unittest.TestCase):
             ('CONFIG_FILE', self.root / 'config.json'),
             ('WALLPAPER_STORE_INDEX', self.store),
             ('get_desktop_contexts', mock.Mock(return_value=self.contexts)),
-            ('is_valid_image', mock.Mock(side_effect=lambda path: Path(path).is_file())),
+            ('image_dimensions', mock.Mock(side_effect=lambda path: (4000, 3000) if Path(path).is_file() else None)),
+            ('primary_display_size', mock.Mock(return_value=(3024, 1964))),
             ('load_config', mock.Mock(return_value={})),
             ('send_notification', mock.Mock()),
         ]:

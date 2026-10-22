@@ -11,6 +11,8 @@ os.environ.setdefault("NASA_API_KEY", "test-key")
 
 import nasa_apod_wallpaper as apod
 
+PRIMARY_DISPLAY_SIZE = apod.primary_display_size
+
 
 def setUpModule():
     directory = tempfile.TemporaryDirectory()
@@ -24,6 +26,9 @@ def setUpModule():
         patch = mock.patch.object(apod, name, path)
         patch.start()
         unittest.addModuleCleanup(patch.stop)
+    patch = mock.patch.object(apod, 'primary_display_size', return_value=None)
+    patch.start()
+    unittest.addModuleCleanup(patch.stop)
 
 
 JPEG_IMAGE = base64.b64decode(
@@ -304,6 +309,28 @@ class FetchApodFromFeedTest(unittest.TestCase):
 
         self.assertEqual(expected_feed_data, result)
         mock_feed.assert_called_once_with("2026-09-30")
+
+
+class FetchApodDataTest(unittest.TestCase):
+    def response(self, image_url):
+        return io.BytesIO(json.dumps({
+            "date": "2026-10-22", "title": "NASA Science", "media_type": "image",
+            "url": image_url, "hdurl": image_url,
+        }).encode())
+
+    def test_rejects_the_science_nasa_logo_without_retrying(self):
+        logo = "https://science.nasa.gov/wp-content/themes/nasa-child/assets/images/nasa-logo@2x.png"
+        with mock.patch.object(apod.urllib.request, "urlopen", return_value=self.response(logo)) as urlopen, \
+                mock.patch.object(apod.time, "sleep") as sleep:
+            self.assertIsNone(apod.fetch_apod_data("2026-10-22", exit_on_error=False, max_attempts=3))
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_returns_an_api_result_with_an_apod_image(self):
+        image = "https://apod.nasa.gov/apod/image/2610/star.jpg"
+        with mock.patch.object(apod.urllib.request, "urlopen", return_value=self.response(image)):
+            result = apod.fetch_apod_data("2026-10-22", exit_on_error=False, max_attempts=1)
+        self.assertEqual(image, result["hdurl"])
 
 
 class FetchApodArticleByUrlTest(unittest.TestCase):
@@ -764,6 +791,63 @@ class MainFallbackTest(unittest.TestCase):
         mock_notify.assert_called_once_with("Arp 78", "Test explanation.")
 
 
+class LowResolutionTest(unittest.TestCase):
+    def test_skips_images_that_fill_would_upscale_more_than_twice(self):
+        with mock.patch.object(apod, "primary_display_size", return_value=(3024, 1964)):
+            self.assertTrue(apod.is_low_resolution((1280, 1280)))
+            self.assertTrue(apod.is_low_resolution((1500, 1000)))
+            self.assertTrue(apod.is_low_resolution((1362, 1920)))
+            self.assertFalse(apod.is_low_resolution((1512, 982)))
+            self.assertFalse(apod.is_low_resolution((2622, 1751)))
+            self.assertFalse(apod.is_low_resolution(None))
+        self.assertFalse(apod.is_low_resolution((1, 1)))
+
+    def test_reads_the_main_display_size(self):
+        with mock.patch.object(apod.subprocess, "run", return_value=mock.Mock(stdout="[3024,1964]\n")):
+            self.assertEqual((3024, 1964), PRIMARY_DISPLAY_SIZE.__wrapped__())
+        with mock.patch.object(apod.subprocess, "run", side_effect=OSError("no display")):
+            self.assertIsNone(PRIMARY_DISPLAY_SIZE.__wrapped__())
+
+    def test_cache_excludes_low_resolution_images(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            small = directory / "apod_2000-01-01.jpg"
+            large = directory / "apod_2000-01-02.jpg"
+            small.write_bytes(JPEG_IMAGE)
+            large.write_bytes(JPEG_IMAGE)
+            sizes = {small: (1280, 1280), large: (4000, 3000)}
+            with mock.patch.object(apod, "WALLPAPER_DIR", directory), \
+                    mock.patch.object(apod, "primary_display_size", return_value=(3024, 1964)), \
+                    mock.patch.object(apod, "image_dimensions", side_effect=sizes.get):
+                self.assertEqual([large], apod.cached_image_files())
+
+    def test_low_resolution_apod_uses_a_cached_image_and_notifies(self):
+        today = apod.datetime.now().strftime("%Y-%m-%d")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            today_image = directory / f"apod_{today}.jpg"
+            older_image = directory / "apod_2000-01-01.jpg"
+            today_image.write_bytes(JPEG_IMAGE)
+            older_image.write_bytes(JPEG_IMAGE)
+            sizes = {today_image: (1280, 1280), older_image: (4000, 3000)}
+            with mock.patch.object(apod, "WALLPAPER_DIR", directory), \
+                    mock.patch.object(apod, "primary_display_size", return_value=(3024, 1964)), \
+                    mock.patch.object(apod, "image_dimensions", side_effect=sizes.get), \
+                    mock.patch.object(apod, "load_config", return_value={}), \
+                    mock.patch.object(apod, "fetch_apod_with_fallback", return_value={
+                        "title": "The First Green Star", "date": today, "media_type": "image",
+                        "hdurl": "https://example.com/green.jpg", "explanation": "Star light."}), \
+                    mock.patch.object(apod, "download_apod_image", return_value=today_image), \
+                    mock.patch.object(apod, "get_current_desktop_1_wallpaper", return_value=today_image), \
+                    mock.patch.object(apod, "set_macos_wallpaper") as set_wallpaper, \
+                    mock.patch.object(apod, "send_notification") as notify, \
+                    mock.patch("sys.argv", ["nasa_apod_wallpaper.py"]):
+                apod.main()
+
+            set_wallpaper.assert_called_once_with(older_image, desktop_1_only=False, apod_date=today)
+            notify.assert_called_once_with("The First Green Star (Low Resolution - Cached Wallpaper)", "Star light.")
+
+
 class CachedWallpaperRefreshTest(unittest.TestCase):
     def test_reapplies_cached_today_to_all_desktops_without_network(self):
         today = apod.datetime.now().strftime("%Y-%m-%d")
@@ -777,7 +861,7 @@ class CachedWallpaperRefreshTest(unittest.TestCase):
                         for space in ('space-1', 'space-2')]
 
             with mock.patch.object(apod, "WALLPAPER_DIR", directory), \
-                    mock.patch.object(apod, "is_valid_image", return_value=True), \
+                    mock.patch.object(apod, "image_dimensions", return_value=(4000, 3000)), \
                     mock.patch.object(apod, "load_config", return_value={}), \
                     mock.patch.object(apod, "fetch_apod_with_fallback") as fetch, \
                     mock.patch.object(apod, "send_notification") as notify, \

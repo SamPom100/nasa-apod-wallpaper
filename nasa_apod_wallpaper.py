@@ -7,6 +7,7 @@ Fetches the Astronomy Picture of the Day and sets it as macOS desktop background
 import os
 import sys
 import copy
+import functools
 import json
 import plistlib
 import hashlib
@@ -35,6 +36,7 @@ DOWNLOAD_TIMEOUT_SECONDS = 30
 DESKTOP_ATTEMPTS = 3
 DESKTOP_RETRY_DELAY_SECONDS = 5
 CACHE_IMAGE_COUNT = 60
+MAX_FILL_UPSCALE = 2.0
 IMAGE_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.tif', '.tiff'
 }
@@ -126,7 +128,11 @@ def fetch_apod_data(date=None, exit_on_error=True, max_attempts=FETCH_ATTEMPTS):
         try:
             print(f"Fetching NASA APOD data{f' for {date}' if date else ''}...", flush=True)
             with urllib.request.urlopen(url, timeout=10) as response:
-                return json.loads(response.read().decode())
+                data = json.loads(response.read().decode())
+            if not is_site_placeholder_image(data.get('hdurl') or data.get('url')):
+                return data
+            print("The NASA API returned the science.nasa.gov logo instead of the APOD image.", flush=True)
+            retry = False
         except urllib.error.HTTPError as e:
             print(f"HTTP Error {e.code}: {e.reason}", flush=True)
             if e.code == 429:
@@ -149,6 +155,11 @@ def fetch_apod_data(date=None, exit_on_error=True, max_attempts=FETCH_ATTEMPTS):
         if exit_on_error:
             sys.exit(1)
         return None
+
+
+def is_site_placeholder_image(url):
+    """Check if a URL is a science.nasa.gov theme asset, such as the NASA logo."""
+    return '/wp-content/themes/' in urllib.parse.urlparse(url or '').path
 
 
 def fetch_apod_from_feed(target_date=None):
@@ -496,7 +507,8 @@ def download_apod_image(apod_data, date_str, exit_on_error=True):
     return None
 
 
-def is_valid_image(path):
+def image_dimensions(path):
+    """Return the (width, height) of an image in pixels, or None if it is not a valid image."""
     try:
         result = subprocess.run(
             ['/usr/bin/sips', '-g', 'pixelWidth', '-g', 'pixelHeight', str(path)],
@@ -507,20 +519,55 @@ def is_valid_image(path):
             for line in result.stdout.splitlines()
             if line.strip().startswith(('pixelWidth:', 'pixelHeight:'))
         ]
-        return len(dimensions) == 2 and all(
-            value.isdecimal() and int(value) > 0 for value in dimensions
-        )
+        if len(dimensions) == 2 and all(value.isdecimal() and int(value) > 0 for value in dimensions):
+            return tuple(int(value) for value in dimensions)
     except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def is_valid_image(path):
+    return image_dimensions(path) is not None
+
+
+@functools.lru_cache(maxsize=None)
+def primary_display_size():
+    """Return the (width, height) of the main display in pixels, or None if it is unknown."""
+    script = '''
+    ObjC.import('CoreGraphics');
+    var mode = $.CGDisplayCopyDisplayMode($.CGMainDisplayID());
+    JSON.stringify([Number($.CGDisplayModeGetPixelWidth(mode)), Number($.CGDisplayModeGetPixelHeight(mode))]);
+    '''
+    try:
+        result = subprocess.run(
+            ['/usr/bin/osascript', '-l', 'JavaScript', '-e', script],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        width, height = json.loads(result.stdout)
+        if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+            return width, height
+    except Exception as error:
+        print(f"Cannot read the display size: {error}")
+    return None
+
+
+def is_low_resolution(size):
+    """Check if Fill on the main display would upscale an image more than MAX_FILL_UPSCALE times."""
+    display = primary_display_size()
+    if not display or not size:
         return False
+    return max(display_side / image_side for display_side, image_side in zip(display, size)) > MAX_FILL_UPSCALE
 
 
 def cached_image_files():
-    """Return cached APOD image files."""
-    return [
-        path for path in WALLPAPER_DIR.glob("apod_*")
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-        and is_valid_image(path)
-    ]
+    """Return cached APOD images that are large enough for the main display."""
+    images = []
+    for path in WALLPAPER_DIR.glob("apod_*"):
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            size = image_dimensions(path)
+            if size is not None and not is_low_resolution(size):
+                images.append(path)
+    return images
 
 
 def pick_cache_images(exclude_path, count):
@@ -1024,6 +1071,7 @@ def main():
         apod_data = None
 
     image_path = None
+    low_resolution = False
     target_date = date or today_str
     apod_date = apod_data.get('date', target_date) if apod_data else state.get('date')
 
@@ -1040,6 +1088,11 @@ def main():
             image_path = download_apod_image(apod_data, target_date, exit_on_error=False)
             if image_path is None:
                 print("Could not download today's APOD image.")
+            elif is_low_resolution(image_dimensions(image_path)):
+                prefix = "The requested" if date else "Today's"
+                print(f"\n{prefix} APOD image is too small for this display.")
+                image_path = None
+                low_resolution = True
         else:
             prefix = "The requested" if date else "Today's"
             print(f"\n{prefix} APOD is not an image (it might be a video).")
@@ -1090,6 +1143,9 @@ def main():
         if apod_data and apod_data.get('media_type') != 'image':
             title = f"{apod_data.get('title', 'NASA APOD')} (Video - Cached Wallpaper)"
             description = apod_data.get('explanation') or f"Today's APOD is not an image. Set {image_path.name} from cache."
+        elif low_resolution:
+            title = f"{apod_data.get('title', 'NASA APOD')} (Low Resolution - Cached Wallpaper)"
+            description = apod_data.get('explanation') or f"Today's APOD is too small. Set {image_path.name} from cache."
         elif apod_data:
             title = f"{apod_data.get('title', 'NASA APOD')} (Cached Wallpaper)"
             description = apod_data.get('explanation') or f"Download failed. Set {image_path.name} from cache."
