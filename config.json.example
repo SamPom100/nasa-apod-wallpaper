@@ -1,4 +1,6 @@
 {
   "api_key": "YOUR_NASA_API_KEY_HERE",
-  "desktop_1_only": false
+  "desktop_1_only": false,
+  "keep_count": 60,
+  "auto_backfill_days": 7
 }

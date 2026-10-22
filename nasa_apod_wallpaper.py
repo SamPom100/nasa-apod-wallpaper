@@ -28,6 +28,7 @@ WALLPAPER_DIR = Path.home() / ".nasa_apod_wallpapers"
 WALLPAPER_DIR.mkdir(exist_ok=True)
 
 CONFIG_FILE = WALLPAPER_DIR / "config.json"
+BACKFILL_STATE_FILE = WALLPAPER_DIR / "backfill_state.json"
 WALLPAPER_STORE_INDEX = Path.home() / "Library/Application Support/com.apple.wallpaper/Store/Index.plist"
 
 FETCH_ATTEMPTS = 6
@@ -882,8 +883,10 @@ def send_notification(title, description):
         print(f"Note: Could not send notification: {e}")
 
 
-def cleanup_old_images(keep_count=CACHE_IMAGE_COUNT):
+def cleanup_old_images(keep_count=None):
     """Remove old APOD images, keeping only the most recent ones"""
+    if keep_count is None:
+        keep_count = load_config().get("keep_count", CACHE_IMAGE_COUNT)
     try:
         image_files = [
             path for path in WALLPAPER_DIR.glob("apod_*")
@@ -961,6 +964,110 @@ def backfill(days):
     cleanup_old_images(keep_count=max(CACHE_IMAGE_COUNT, days))
 
 
+def load_backfill_state():
+    """Load auto-backfill tracking state."""
+    if BACKFILL_STATE_FILE.exists():
+        try:
+            with open(BACKFILL_STATE_FILE, "r") as f:
+                state = json.load(f)
+                if isinstance(state, dict):
+                    return state
+        except Exception as e:
+            print(f"Warning: Could not read backfill state: {e}")
+    return {}
+
+
+def save_backfill_state(state):
+    """Save auto-backfill tracking state atomically."""
+    try:
+        temporary_path = BACKFILL_STATE_FILE.with_suffix(f"{BACKFILL_STATE_FILE.suffix}.tmp")
+        with open(temporary_path, "w") as f:
+            json.dump(state, f, indent=2)
+        temporary_path.replace(BACKFILL_STATE_FILE)
+    except Exception as e:
+        print(f"Warning: Could not save backfill state: {e}")
+
+
+def get_auto_backfill_days(config):
+    """Determine the number of days to auto-backfill from CLI args or config."""
+    if "--no-auto-backfill" in sys.argv:
+        return 0
+    for arg in sys.argv:
+        if arg.startswith("--auto-backfill="):
+            try:
+                return int(arg.split("=", 1)[1])
+            except ValueError:
+                return 7
+        if arg == "--auto-backfill":
+            return 7
+    days = config.get("auto_backfill_days")
+    if days is not None:
+        try:
+            return int(days)
+        except (ValueError, TypeError):
+            return 7
+    if config.get("auto_backfill"):
+        return 7
+    return 0
+
+
+def auto_backfill(days=7):
+    """Automatically check and backfill missing APOD images within the last `days` days."""
+    if days <= 0:
+        return
+
+    state = load_backfill_state()
+    checked = state.get("checked_dates", {})
+    now = datetime.now()
+
+    # Fast-check missing days (excluding today, which main handles)
+    missing_dates = []
+    for offset in range(1, days + 1):
+        date_str = (now - timedelta(days=offset)).strftime('%Y-%m-%d')
+        # Check if any image file already exists on disk for this date
+        if any(WALLPAPER_DIR.glob(f"apod_{date_str}.*")):
+            continue
+        # Check if already checked and marked non-image/video/unavailable
+        if date_str in checked:
+            continue
+        missing_dates.append(date_str)
+
+    if not missing_dates:
+        return
+
+    downloaded = 0
+    updated_checked = dict(checked)
+
+    for date_str in missing_dates:
+        data = fetch_apod_from_science_nasa(date_str)
+        if data is None:
+            data = fetch_apod_data(date_str, exit_on_error=False, max_attempts=1)
+        if data is None:
+            updated_checked[date_str] = "unavailable"
+            continue
+        if data.get('media_type') != 'image' and not data.get('hdurl'):
+            updated_checked[date_str] = "video"
+            continue
+
+        if download_apod_image(data, date_str, exit_on_error=False) is not None:
+            downloaded += 1
+            updated_checked[date_str] = "downloaded"
+        else:
+            updated_checked[date_str] = "failed"
+
+    # Retain checked records for the last 60 days to keep file small
+    cutoff = (now - timedelta(days=max(60, days * 2))).strftime('%Y-%m-%d')
+    pruned_checked = {k: v for k, v in updated_checked.items() if k >= cutoff}
+
+    state["last_run"] = now.isoformat()
+    state["checked_dates"] = pruned_checked
+    save_backfill_state(state)
+
+    if downloaded > 0:
+        print(f"Auto-backfill: cached {downloaded} missing APOD image(s).", flush=True)
+        cleanup_old_images()
+
+
 def get_current_desktop_1_wallpaper():
     """Return the Path to the current wallpaper set on desktop 1, or None."""
     contexts = get_desktop_contexts()
@@ -1036,9 +1143,13 @@ def main():
 
     # Check for --force flag
     force_update = "--force" in sys.argv
+    auto_backfill_days = get_auto_backfill_days(config)
     args = [
         arg for arg in sys.argv[1:]
-        if arg not in ("--force", "--desktop-1-only", "--all-desktops", "--shuffle", "--random")
+        if arg not in (
+            "--force", "--desktop-1-only", "--all-desktops", "--shuffle", "--random",
+            "--auto-backfill", "--no-auto-backfill",
+        ) and not arg.startswith("--auto-backfill=")
     ]
 
     # Get date from command line argument if provided
@@ -1059,9 +1170,13 @@ def main():
                 current_wallpaper = get_current_desktop_1_wallpaper()
                 if current_wallpaper and cached_image.resolve() == current_wallpaper.resolve():
                     print(f"Today's APOD ({today_str}) is already set as Desktop 1 wallpaper.")
+                    if date is None:
+                        auto_backfill(auto_backfill_days)
                     return
             print(f"Using the cached APOD for {today_str}.")
             set_macos_wallpaper(cached_image, desktop_1_only=desktop_1_only, apod_date=today_str)
+            if date is None:
+                auto_backfill(auto_backfill_days)
             return
 
     # Fetch APOD data (with fallback to yesterday if today isn't available)
@@ -1128,15 +1243,21 @@ def main():
         current_wallpaper = get_current_desktop_1_wallpaper()
         if current_wallpaper and image_path.resolve() == current_wallpaper.resolve():
             if reused_fallback:
+                if date is None:
+                    auto_backfill(auto_backfill_days)
                 return
             state.update(date=apod_date, primary=str(Path(image_path).resolve()))
             save_wallpaper_state(state)
             print(f"Desktop 1 already has {image_path.name} set.")
+            if date is None:
+                auto_backfill(auto_backfill_days)
             return
 
     set_macos_wallpaper(image_path, desktop_1_only=desktop_1_only, apod_date=apod_date)
 
     if reused_fallback:
+        if date is None:
+            auto_backfill(auto_backfill_days)
         return
 
     if used_cached_fallback:
@@ -1169,6 +1290,9 @@ def main():
         print("Description:")
         print(apod_data.get('explanation', 'N/A'))
         print("=" * 60)
+
+    if date is None:
+        auto_backfill(auto_backfill_days)
 
 
 if __name__ == "__main__":

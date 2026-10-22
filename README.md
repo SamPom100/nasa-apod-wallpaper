@@ -10,6 +10,7 @@
 - Sets it as your Mac desktop wallpaper (supports Desktop 1 only or all spaces).
 - Safely preserves any folder shuffle configured on secondary spaces without advancing them on wake.
 - Uses saved pictures if today's post is a video, too small for the display, or offline.
+- Automatically fills in any missing days if your Mac was shut down or offline (configurable via `auto_backfill_days`).
 
 ## Usage
 

@@ -21,6 +21,7 @@ def setUpModule():
     for name, path in [
         ('WALLPAPER_DIR', root),
         ('CONFIG_FILE', root / 'config.json'),
+        ('BACKFILL_STATE_FILE', root / 'backfill_state.json'),
         ('WALLPAPER_STORE_INDEX', root / 'Index.plist'),
     ]:
         patch = mock.patch.object(apod, name, path)
@@ -497,6 +498,95 @@ class BackfillTest(unittest.TestCase):
             apod.backfill(2)
 
         download.assert_called_once_with(posts['video-still'], '2026-09-13', exit_on_error=False)
+
+
+class AutoBackfillTest(unittest.TestCase):
+    def setUp(self):
+        if apod.BACKFILL_STATE_FILE.exists():
+            apod.BACKFILL_STATE_FILE.unlink()
+        for p in apod.WALLPAPER_DIR.glob("apod_*"):
+            if p.is_file():
+                p.unlink()
+
+    def test_auto_backfill_downloads_missing_past_days(self):
+        now = apod.datetime(2026, 9, 13)
+        post_12 = {'media_type': 'image', 'hdurl': 'https://example.com/12.jpg'}
+        post_11 = {'media_type': 'image', 'hdurl': 'https://example.com/11.jpg'}
+
+        with mock.patch.object(apod, 'datetime') as fake_datetime, \
+                mock.patch.object(apod, 'fetch_apod_from_science_nasa', side_effect=[post_12, post_11]), \
+                mock.patch.object(apod, 'download_apod_image', return_value=Path('/tmp/img.jpg')) as download, \
+                mock.patch.object(apod, 'cleanup_old_images'):
+            fake_datetime.now.return_value = now
+            fake_datetime.side_effect = lambda *args, **kw: apod.datetime(*args, **kw)
+            apod.auto_backfill(days=2)
+
+        self.assertEqual(2, download.call_count)
+        state = apod.load_backfill_state()
+        self.assertEqual('downloaded', state.get('checked_dates', {}).get('2026-09-12'))
+        self.assertEqual('downloaded', state.get('checked_dates', {}).get('2026-09-11'))
+
+    def test_auto_backfill_skips_already_cached_days(self):
+        now = apod.datetime(2026, 9, 13)
+        post_11 = {'media_type': 'image', 'hdurl': 'https://example.com/11.jpg'}
+
+        # Create cached file for 2026-09-12
+        cached_file = apod.WALLPAPER_DIR / 'apod_2026-09-12.jpg'
+        cached_file.write_bytes(JPEG_IMAGE)
+
+        with mock.patch.object(apod, 'datetime') as fake_datetime, \
+                mock.patch.object(apod, 'fetch_apod_from_science_nasa', return_value=post_11) as fetch, \
+                mock.patch.object(apod, 'download_apod_image', return_value=Path('/tmp/img.jpg')) as download, \
+                mock.patch.object(apod, 'cleanup_old_images'):
+            fake_datetime.now.return_value = now
+            fake_datetime.side_effect = lambda *args, **kw: apod.datetime(*args, **kw)
+            apod.auto_backfill(days=2)
+
+        # 2026-09-12 was already on disk, so only 2026-09-11 should be fetched and downloaded
+        fetch.assert_called_once_with('2026-09-11')
+        download.assert_called_once_with(post_11, '2026-09-11', exit_on_error=False)
+
+    def test_auto_backfill_records_and_skips_videos(self):
+        now = apod.datetime(2026, 9, 13)
+        video_post = {'media_type': 'video', 'hdurl': None}
+
+        # First run: finds 2026-09-12 is a video
+        with mock.patch.object(apod, 'datetime') as fake_datetime, \
+                mock.patch.object(apod, 'fetch_apod_from_science_nasa', return_value=video_post) as fetch, \
+                mock.patch.object(apod, 'download_apod_image') as download:
+            fake_datetime.now.return_value = now
+            fake_datetime.side_effect = lambda *args, **kw: apod.datetime(*args, **kw)
+            apod.auto_backfill(days=1)
+
+        fetch.assert_called_once_with('2026-09-12')
+        download.assert_not_called()
+        state = apod.load_backfill_state()
+        self.assertEqual('video', state.get('checked_dates', {}).get('2026-09-12'))
+
+        # Second run: 2026-09-12 is recorded as video, so fetch should NOT be called again
+        with mock.patch.object(apod, 'datetime') as fake_datetime, \
+                mock.patch.object(apod, 'fetch_apod_from_science_nasa') as fetch_second, \
+                mock.patch.object(apod, 'download_apod_image') as download_second:
+            fake_datetime.now.return_value = now
+            fake_datetime.side_effect = lambda *args, **kw: apod.datetime(*args, **kw)
+            apod.auto_backfill(days=1)
+
+        fetch_second.assert_not_called()
+        download_second.assert_not_called()
+
+    def test_get_auto_backfill_days(self):
+        self.assertEqual(0, apod.get_auto_backfill_days({}))
+        self.assertEqual(7, apod.get_auto_backfill_days({'auto_backfill': True}))
+        self.assertEqual(14, apod.get_auto_backfill_days({'auto_backfill_days': 14}))
+
+        with mock.patch('sys.argv', ['prog', '--auto-backfill']):
+            self.assertEqual(7, apod.get_auto_backfill_days({}))
+
+        with mock.patch('sys.argv', ['prog', '--auto-backfill=10']):
+            self.assertEqual(10, apod.get_auto_backfill_days({}))
+
+        with mock.patch('sys.argv', ['prog', '--no-auto-backfill']):
+            self.assertEqual(0, apod.get_auto_backfill_days({'auto_backfill_days': 14}))
 
 
 class SetMacOsWallpaperTest(unittest.TestCase):
